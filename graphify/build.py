@@ -32,7 +32,7 @@ import networkx as nx
 from .ids import make_id, normalize_id as _normalize_id
 from .paths import default_graph_json as _default_graph_json
 from .paths import is_absolute_any_platform as _is_abs
-from .validate import validate_extraction
+from .validate import VALID_FILE_TYPES, validate_extraction
 
 
 # Deterministic (AST) extractors emit source_location "L<line>"; the semantic
@@ -853,7 +853,11 @@ def build_from_json(extraction: dict, *, directed: bool = False, root: str | Pat
         if node.get("file_type") in (None, ""):
             node["file_type"] = "concept"
         ft = node.get("file_type", "")
-        if ft and ft not in {"code", "document", "paper", "image", "rationale", "concept"}:
+        # Single source of truth: the validator's enum (which also carries
+        # the OpenAPI tier's api_operation / inferred_entity, #add-openapi-extractor).
+        # Anything else folds through the synonym map so legacy values still
+        # land on a legal type instead of tripping validation.
+        if ft and ft not in VALID_FILE_TYPES:
             node["file_type"] = _FILE_TYPE_SYNONYMS.get(ft, "concept")
 
     # Canonicalize hyperedge member lists (#1561): producers sometimes key the
@@ -1368,6 +1372,14 @@ def build(
         combined["hyperedges"].extend(ext.get("hyperedges", []))
         combined["input_tokens"] += ext.get("input_tokens", 0)
         combined["output_tokens"] += ext.get("output_tokens", 0)
+    # OpenAPI tier (#add-openapi-extractor): fold merged api_operation nodes
+    # into inferred database entities BEFORE dedup, so virtual entities and
+    # their reads_from/writes_to/belongs_to edges flow through dedup and
+    # clustering like any other product. Local import keeps the module's
+    # import graph acyclic (api_inference lives at build tier, not extractor
+    # tier, so nothing else pulls it in at package load).
+    from graphify.api_inference import run_api_entity_inference
+    run_api_entity_inference(combined)
     if dedup and combined["nodes"]:
         # Numeric ids must be str before dedup, which keys on them and would
         # raise TypeError in _pick_winner's regex search (#2326). build_from_json

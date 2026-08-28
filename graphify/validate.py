@@ -1,7 +1,10 @@
 # validate extraction JSON against the graphify schema before graph assembly
 from __future__ import annotations
 
-VALID_FILE_TYPES = {"code", "document", "paper", "image", "rationale", "concept"}
+VALID_FILE_TYPES = {"code", "document", "paper", "image", "rationale", "concept",
+                    # OpenAPI tier (#add-openapi-extractor): one node per path×method,
+                    # and build-phase reverse-derived database entities.
+                    "api_operation", "inferred_entity"}
 VALID_CONFIDENCES = {"EXTRACTED", "INFERRED", "AMBIGUOUS"}
 REQUIRED_NODE_FIELDS = {"id", "label", "file_type", "source_file"}
 REQUIRED_EDGE_FIELDS = {"source", "target", "relation", "confidence", "source_file"}

@@ -40,3 +40,6 @@ paper/
 
 # macOS Finder metadata
 .DS_Store
+
+# Integration test output (regenerable: graph.json, GRAPH_REPORT.md, cache/)
+tests/api-graph/

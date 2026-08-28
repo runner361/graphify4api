@@ -324,8 +324,15 @@ def test_dispatch_routes_mcp_filename_to_mcp_extractor(tmp_path):
 
 
 def test_dispatch_does_not_reroute_generic_json(tmp_path):
-    from graphify.extract import _get_extractor, extract_json
+    from graphify.extract import _get_extractor, extract_json, extract_json_spec_aware
 
     p = _write(tmp_path, "package.json", {"name": "x", "version": "1.0.0"})
     extractor = _get_extractor(p)
-    assert extractor is extract_json
+    # #add-openapi-extractor: .json dispatch is a spec-aware router; for a
+    # non-spec it must delegate to extract_json (the config/manifest path) so
+    # generic JSON is never rerouted into OpenAPI extraction.
+    assert extractor is extract_json_spec_aware
+    # behavior preserved: a package.json still produces config/manifest nodes,
+    # not an OpenAPI skip verdict.
+    out = extractor(p)
+    assert not any(n["file_type"] == "api_operation" for n in out.get("nodes", []))

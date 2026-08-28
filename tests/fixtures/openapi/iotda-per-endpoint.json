@@ -1,0 +1,52 @@
+{
+  "id": "7cfd9db6537c40eea3a7d1d8fc44b1c1",
+  "name": "CreateProduct",
+  "summary": "创建产品",
+  "tags": "产品管理",
+  "product_short": "IoTDA",
+  "version": "2.0",
+  "method": "post",
+  "host": "iotda.cn-north-4.myhuaweicloud.com",
+  "schemes": ["https"],
+  "consumes": "[\"application/json;charset=UTF-8\"]",
+  "base_path": null,
+  "components": null,
+  "security_definitions": null,
+  "parameters": {},
+  "info_version": "v5",
+  "paths": {
+    "/v5/iot/{project_id}/products": {
+      "post": {
+        "tags": ["ProductManagement"],
+        "operationId": "CreateProduct",
+        "parameters": [
+          {"name": "project_id", "in": "path", "required": true, "type": "string"},
+          {"name": "body", "in": "body", "required": true,
+           "schema": {"$ref": "#/definitions/AddProduct"}}
+        ],
+        "responses": {
+          "201": {"schema": {"$ref": "#/definitions/Product"}}
+        }
+      }
+    }
+  },
+  "definitions": {
+    "Product": {
+      "type": "object",
+      "properties": {
+        "product_id": {"type": "string"},
+        "name": {"type": "string"},
+        "app_id": {"type": "string"}
+      }
+    },
+    "AddProduct": {
+      "type": "object",
+      "required": ["name"],
+      "properties": {
+        "name": {"type": "string"},
+        "app_id": {"type": "string"},
+        "data_format": {"type": "string"}
+      }
+    }
+  }
+}

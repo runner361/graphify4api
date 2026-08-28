@@ -3415,8 +3415,11 @@ def test_extract_bash_via_dispatch():
 
 
 def test_extract_json_via_dispatch():
-    from graphify.extract import _get_extractor
-    assert _get_extractor(Path("foo.json")) is extract_json
+    from graphify.extract import _get_extractor, extract_json_spec_aware
+    # #add-openapi-extractor: .json now routes through a spec-aware probe that
+    # falls back to the config/manifest extractor for non-specs, so OpenAPI
+    # specs get structured extraction while ordinary JSON behaves as before.
+    assert _get_extractor(Path("foo.json")) is extract_json_spec_aware
 
 
 def test_extensionless_shebang_via_dispatch(tmp_path):

@@ -17,8 +17,9 @@ Signatures below are the real ones - `tests/test_architecture_doc.py` imports ev
 | Module | Entry point(s) | Input → Output |
 |--------|----------------|----------------|
 | `detect.py` | `detect(root)` | directory → scan summary dict: `files` grouped by category, plus `total_files`, `total_words`, `warning`, `scan_root`, … |
-| `extract.py` | `extract(paths, *, root=None, ...)`, `collect_files(target)` | **list** of file paths → `{nodes, edges}` dict. `collect_files` expands a directory into that list, and lives here, not in `detect.py` |
+| `extract.py` | `extract(paths, *, root=None, ...)`, `collect_files(target)`, `extract_openapi(path)` | **list** of file paths → `{nodes, edges}` dict. `collect_files` expands a directory into that list, and lives here, not in `detect.py`. `extract_openapi` parses OpenAPI/Swagger JSON specs into operation/schema/tag nodes + `$ref` edges |
 | `build.py` | `build(extractions)`, `build_from_json(extraction)` | extraction dict(s) → `nx.Graph` |
+| `api_inference.py` | `run_api_entity_inference(extraction)` | merged extraction (mutated in place) → adds `inferred_entity` nodes (one per REST resource) + INFERRED `reads_from`/`writes_to`/`belongs_to` edges, reverse-inferring backend database entities from OpenAPI products when no `.sql` DDL is present |
 | `cluster.py` | `cluster(G)` | graph → `{community_id: [node_id, ...]}` (the graph is not mutated) |
 | `analyze.py` | `god_nodes(G)`, `surprising_connections(G)`, `suggest_questions(G, communities, community_labels)`, `find_import_cycles(G)`, `graph_diff(G_old, G_new)` | graph → one list/dict per analysis. There is no single `analyze()` entry point |
 | `report.py` | `generate(G, communities, cohesion_scores, community_labels, ...)` | graph + analysis → GRAPH_REPORT.md string |

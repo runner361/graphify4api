@@ -346,6 +346,7 @@ To remove graphify from all platforms at once: `graphify uninstall` (add `--purg
 | Common Lisp | `.lisp .cl .lsp .asd` (requires `uv tool install graphifyy[commonlisp]`) |
 | Robot Framework | `.robot .resource` (via the official `robot.api` parser, requires `uv tool install graphifyy[robot]`; suites, test cases, user keywords, keyword-call and Resource/Library/Variables import edges) |
 | MCP configs | `.mcp.json` `mcp.json` `mcp_servers.json` `claude_desktop_config.json` — extracts server nodes, package refs, env var requirements |
+| OpenAPI / Swagger | any `.json` carrying an `openapi`/`swagger` version + `paths` — one `api_operation` node per path×method, schema/tag nodes, `$ref` `references` edges, `grouped_under`/`subpath_of`/`shares_schema_with` edges. At build time CRUD clusters over one REST resource collapse into a single `inferred_entity` node (reverse-inferring backend DB entities from the spec when no `.sql` DDL is present), with `reads_from`/`writes_to`/`belongs_to` INFERRED edges |
 | Package manifests | `apm.yml` `pyproject.toml` `go.mod` `pom.xml` — one canonical package node per package (by name) plus `depends_on` edges, so a package referenced from many manifests is a single hub |
 | Docs | `.md .mdx .qmd .html .txt .rst .yaml .yml` (markdown `[text](./other.md)` links and `[[wikilinks]]` become `references` edges between docs) |
 | Office | `.docx .xlsx` (requires `uv tool install graphifyy[office]`) |

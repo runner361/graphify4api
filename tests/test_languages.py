@@ -10,7 +10,9 @@ from graphify.extract import (
     extract_dm, extract_dmi, extract_dmm, extract_dmf,
     extract_powershell, extract_apex, extract_commonlisp, extract_verilog,
     extract_powershell_manifest, extract_robot,
+    extract_openapi, extract_json_spec_aware,
 )
+from graphify.extractors.openapi import _is_openapi_spec
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -4427,3 +4429,142 @@ def test_robot_path_variables_match_case_space_underscore_insensitively():
     assert _resolve_robot_import("..${/}Resource${/}common.robot", rel_src) == P("Tests/Resource/common.robot")
     # any other variable, in any casing, still yields no edge
     assert _resolve_robot_import("${Root_Dir}/x.robot", rel_src) is None
+# OpenAPI / Swagger spec extraction (#add-openapi-extractor)
+# Pure-stdlib extractor (json.loads, no tree-sitter) — no skip marks needed.
+
+OPENAPI3 = FIXTURES / "openapi" / "openapi3-petstore.json"
+SWAGGER2 = FIXTURES / "openapi" / "swagger2-minimal.json"
+
+
+def test_openapi_spec_produces_operation_schema_tag_nodes():
+    r = extract_openapi(OPENAPI3)
+    ops = [n for n in r["nodes"] if n["file_type"] == "api_operation"]
+    assert len(ops) == 10
+    assert "GET /users" in [n["label"] for n in ops]
+    assert "DELETE /users/{id}" in [n["label"] for n in ops]
+    assert "POST /users/batchDelete" in [n["label"] for n in ops]  # RPC op survives as a node
+    get = next(n for n in ops if n["label"] == "GET /users")
+    assert get["http_method"] == "GET" and get["api_path"] == "/users"
+    assert get["_origin"] == "ast"  # deterministic tier, dedup-protected
+
+    schemas = [n for n in r["nodes"] if n.get("openapi_kind") == "schema"]
+    assert {n["label"] for n in schemas} >= {"User", "NewUser", "Order", "OrderItem", "Profile"}
+    user = next(n for n in schemas if n["label"] == "User")
+    assert set(user["properties"]) == {"id", "name", "profile", "pets"}
+    new_user = next(n for n in schemas if n["label"] == "NewUser")
+    assert "password" in new_user["properties"]  # allOf composite contributes
+
+    tags = [n for n in r["nodes"] if n.get("openapi_kind") == "tag"]
+    assert {n["label"] for n in tags} == {"users", "orders"}
+
+
+def test_openapi_ref_edges_including_nested_occurrences():
+    r = extract_openapi(OPENAPI3)
+    refs = _references(r)
+    pairs = {(s, t) for s, t, _ in refs}
+    assert ("GET /users", "User") in pairs          # response array items $ref
+    assert ("POST /users", "User") in pairs         # allOf member inside requestBody
+    assert ("User", "Profile") in pairs             # nested property $ref
+    assert ("Order", "OrderItem") in pairs          # array items $ref
+    assert ("NewUser", "User") in pairs             # allOf member $ref
+    for _, _, e in refs:
+        assert e["confidence"] == "EXTRACTED"
+        assert e["_origin"] == "ast"
+
+
+def test_openapi_grouped_under_and_subpath_of():
+    r = extract_openapi(OPENAPI3)
+    labels = {n["id"]: n["label"] for n in r["nodes"]}
+    grouped = {(labels[e["source"]], labels[e["target"]])
+               for e in _edges_with_relation(r, "grouped_under")}
+    assert ("GET /users", "users") in grouped
+    assert ("GET /users/{id}/orders", "orders") in grouped
+    sub = {(labels[e["source"]], labels[e["target"]])
+           for e in _edges_with_relation(r, "subpath_of")}
+    assert ("GET /users/{id}", "GET /users") in sub       # same-method parent
+    assert ("DELETE /users/{id}", "GET /users") in sub    # fallback: parent's first op
+    assert ("GET /users/{id}/orders", "GET /users/{id}") in sub
+    for e in _edges_with_relation(r, "grouped_under", "subpath_of"):
+        assert e["confidence"] == "EXTRACTED"
+
+
+def test_openapi_shares_schema_with_inferred_095():
+    r = extract_openapi(OPENAPI3)
+    labels = {n["id"]: n["label"] for n in r["nodes"]}
+    shares = [e for e in r["edges"] if e["relation"] == "shares_schema_with"]
+    pairs = {(labels[e["source"]], labels[e["target"]]) for e in shares}
+    assert ("GET /users", "POST /users") in pairs
+    for e in shares:
+        assert e["confidence"] == "INFERRED"
+        assert e["confidence_score"] == 0.95
+        assert "shared schema" in e.get("context", "")
+
+
+def test_swagger2_normalization_matches_openapi3_products():
+    r = extract_openapi(SWAGGER2)
+    ops = [n for n in r["nodes"] if n["file_type"] == "api_operation"]
+    assert {n["label"] for n in ops} == {
+        "GET /api/devices", "POST /api/devices",
+        "GET /api/devices/{deviceId}", "DELETE /api/devices/{deviceId}",
+    }  # basePath folded into paths
+    get = next(n for n in ops if n["label"] == "GET /api/devices")
+    assert get["refs_read"] == ["DeviceList"]  # direct $ref to the list schema;
+    # the Device $ref nested inside DeviceList's definition is collected by the
+    # schema->schema references pass, not the op's refs_read leaf walk.
+    post = next(n for n in ops if n["label"] == "POST /api/devices")
+    assert post["refs_write"] == ["Device"]  # parameters[in=body] = write side
+    # both spec versions flow through one normalized shape: same edge kinds
+    assert {"references", "grouped_under", "subpath_of", "shares_schema_with",
+            "contains"} <= _relations(r)
+
+
+def test_json_dispatch_routes_specs_and_falls_back(tmp_path):
+    spec = extract_json_spec_aware(OPENAPI3)
+    assert any(n["file_type"] == "api_operation" for n in spec["nodes"])
+    # data json -> never an openapi spec; either the config/manifest
+    # extractor's skip verdict (tree-sitter-json present) or its grammar
+    # error (absent), but never openapi operation nodes.
+    data = tmp_path / "data.json"
+    data.write_text('{"rows": [1, 2, 3]}', encoding="utf-8")
+    data_out = extract_json_spec_aware(data)
+    assert not any(n["file_type"] == "api_operation" for n in data_out.get("nodes", []))
+    # unparseable candidate (probe bytes hit) still falls back, no crash
+    broken = tmp_path / "broken.json"
+    broken.write_text('{"openapi": "3.0.0", "paths": ', encoding="utf-8")
+    out = extract_json_spec_aware(broken)
+    assert out.get("skipped") or out.get("error")
+
+
+def test_openapi_over_20mib_is_rejected(tmp_path):
+    big = tmp_path / "big.json"
+    with big.open("wb") as f:
+        f.write(b'{"openapi":"3.0.0","paths":{')
+        f.write(b" " * (21 * 1024 * 1024))
+    r = extract_openapi(big)
+    assert r.get("error") and "20 MiB" in r["error"]
+
+
+def test_openapi_recognizes_nonstandard_per_endpoint_export():
+    """A non-standard per-endpoint export (Huawei IoTDA: one JSON per
+    operation, no ``openapi``/``swagger`` key, ``version:"2.0"`` under a
+    ``version`` key, one path x one method) must still be recognized and
+    extracted — the real tests/opeapi/iotda corpus is 173 such files."""
+    r = extract_openapi(FIXTURES / "openapi" / "iotda-per-endpoint.json")
+    ops = [n for n in r["nodes"] if n["file_type"] == "api_operation"]
+    assert len(ops) == 1
+    assert ops[0]["label"] == "POST /v5/iot/{project_id}/products"
+    assert ops[0]["operation_id"] == "CreateProduct"
+    assert ops[0]["refs_write"] == ["AddProduct"]
+    assert ops[0]["refs_read"] == ["Product"]
+    schemas = {n["label"]: n for n in r["nodes"] if n.get("openapi_kind") == "schema"}
+    assert set(schemas) == {"Product", "AddProduct"}
+    assert set(schemas["AddProduct"]["properties"]) == {"name", "app_id", "data_format"}
+    tags = [n["label"] for n in r["nodes"] if n.get("openapi_kind") == "tag"]
+    assert tags == ["ProductManagement"]
+    # the spec-file node records the non-standard version provenance
+    spec = next(n for n in r["nodes"] if n.get("openapi_kind") == "spec")
+    assert spec["spec_version"] == "2.0"
+    # data JSON (paths key but no method-bearing path item, no schema
+    # container) still does NOT match the broadened recognition
+    assert not _is_openapi_spec({"paths": {"/x": {"summary": "y"}}})
+    assert not _is_openapi_spec({"rows": [1, 2, 3]})

@@ -50,6 +50,30 @@ EXTRACTED edges always have confidence 1.0. INFERRED edges use a discrete rubric
 
 ---
 
+## OpenAPI reverse inference (database entities from API specs)
+
+When the corpus contains OpenAPI/Swagger JSON (any `.json` with an `openapi`/`swagger` version string and a `paths` object), graphify extracts it deterministically — no LLM, no tree-sitter, just `json.loads`:
+
+- **operation nodes** — one per path × HTTP method (`GET /users`, `POST /orders`), carrying the referenced schema names split into `refs_read` (response side) and `refs_write` (request body side)
+- **schema / tag nodes** — named schemas (with their property lists, merging `allOf`/`anyOf`/`oneOf` composites) and tags
+- **EXTRACTED edges** — `references` (every `$ref`, including nested array/property/composite occurrences), `grouped_under` (operation → tag), `subpath_of` (nested path → parent), `contains` (spec file → node)
+- **INFERRED edge** — `shares_schema_with` (0.95) between operations referencing the same schema
+
+The build phase then reverse-infers the **backend database entities** the API implies — the core premise being that a REST backend usually backs one table per resource. This runs after the per-file extractions merge and before dedup, in `api_inference.run_api_entity_inference`:
+
+- **resource extraction** — paths are split on `/`, `{param}` segments dropped, generic/version segments (`api`, `v1`) removed; the last non-param segment names the resource (`/users/{id}/orders` → `orders`)
+- **CRUD merge** — the full CRUD set over one resource collapses into ONE `inferred_entity` node (`devices (inferred)`), carrying `inferred: true` + `file_type: inferred_entity` as honest markers so virtual entities stay distinguishable from real structure in `graph.json` and `GRAPH_REPORT.md`
+- **column aggregation** — the union of properties across every schema the resource's operations `$ref`, with `read_columns` / `write_columns` provenance (response vs request side)
+- **op → entity edges** — `reads_from` (GET/HEAD/OPTIONS) and `writes_to` (POST/PUT/PATCH/DELETE), INFERRED 0.95
+- **entity relations** — `belongs_to` from nested paths (`orders belongs_to users`), upgraded to 0.95 when a schema `$ref` between the two entities' schemas corroborates the nesting (0.85 otherwise); entity `references` from schema `$ref` links not covered by nesting (0.85)
+- **RPC exclusion** — verb-segment paths (`/user/delete`, `/devices/batchDeleteUsers`, `.../freeze`) name actions, not resources; they keep their operation nodes but opt out of entity inference
+
+When the corpus also contains real DDL (`.sql` `CREATE TABLE` nodes), reconciliation prefers the real table: operations link to the **real** table node, the inferred columns attach as supplementary `inferred_columns`, and no virtual entity is minted. Unmatched virtual entities survive as-is — no `AMBIGUOUS` noise edges.
+
+Entity node ids are global (`entity_<resource>`), not per-file, so the same resource split across several spec files merges into one entity.
+
+---
+
 ## Token benchmark
 
 The first run extracts and builds the graph — this costs tokens. Every subsequent query reads the compact graph instead of raw files. That's where the savings compound.

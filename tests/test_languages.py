@@ -13,6 +13,16 @@ from graphify.extract import (
     extract_openapi, extract_json_spec_aware,
 )
 from graphify.extractors.openapi import _is_openapi_spec
+from graphify.api_inference import run_api_entity_inference
+
+
+def _with_inference(r):
+    """Apply build-tier op structural edges to an extraction result so tests
+    can assert subpath_of / shares_schema_with (now computed cross-file at
+    build tier, not per-file in the extractor)."""
+    run_api_entity_inference(r)
+    return r
+
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -4473,7 +4483,8 @@ def test_openapi_ref_edges_including_nested_occurrences():
 
 
 def test_openapi_grouped_under_and_subpath_of():
-    r = extract_openapi(OPENAPI3)
+    # subpath_of moved to the build tier (cross-file); apply inference first.
+    r = _with_inference(extract_openapi(OPENAPI3))
     labels = {n["id"]: n["label"] for n in r["nodes"]}
     grouped = {(labels[e["source"]], labels[e["target"]])
                for e in _edges_with_relation(r, "grouped_under")}
@@ -4489,7 +4500,8 @@ def test_openapi_grouped_under_and_subpath_of():
 
 
 def test_openapi_shares_schema_with_inferred_095():
-    r = extract_openapi(OPENAPI3)
+    # shares_schema_with is now inferred cross-file at the build tier.
+    r = _with_inference(extract_openapi(OPENAPI3))
     labels = {n["id"]: n["label"] for n in r["nodes"]}
     shares = [e for e in r["edges"] if e["relation"] == "shares_schema_with"]
     pairs = {(labels[e["source"]], labels[e["target"]]) for e in shares}
@@ -4501,7 +4513,7 @@ def test_openapi_shares_schema_with_inferred_095():
 
 
 def test_swagger2_normalization_matches_openapi3_products():
-    r = extract_openapi(SWAGGER2)
+    r = _with_inference(extract_openapi(SWAGGER2))
     ops = [n for n in r["nodes"] if n["file_type"] == "api_operation"]
     assert {n["label"] for n in ops} == {
         "GET /api/devices", "POST /api/devices",
@@ -4514,6 +4526,7 @@ def test_swagger2_normalization_matches_openapi3_products():
     post = next(n for n in ops if n["label"] == "POST /api/devices")
     assert post["refs_write"] == ["Device"]  # parameters[in=body] = write side
     # both spec versions flow through one normalized shape: same edge kinds
+    # (subpath_of / shares_schema_with arrive via the build-tier inference)
     assert {"references", "grouped_under", "subpath_of", "shares_schema_with",
             "contains"} <= _relations(r)
 

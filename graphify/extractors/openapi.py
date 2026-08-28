@@ -7,9 +7,12 @@ Deterministic, LLM-free parse of OpenAPI 3.x and Swagger 2.0 JSON specs:
   ``properties``) and per tag (``openapi_kind: "tag"``)
 * EXTRACTED edges: ``contains`` (spec file -> node), ``references`` ($ref,
   including nested array/allOf/property occurrences), ``grouped_under``
-  (operation -> tag), ``subpath_of`` (nested path operation -> parent op)
-* INFERRED edge: ``shares_schema_with`` between operations referencing the
-  same schema (0.95 — direct structural evidence)
+  (operation -> tag)
+* ``subpath_of`` (nested path operation -> parent op) and
+  ``shares_schema_with`` (operations referencing the same schema) are NOT
+  emitted here — they are computed at the build tier by
+  :mod:`graphify.api_inference` so they span spec files (a per-endpoint
+  split corpus still gets them).
 
 Swagger 2 and OpenAPI 3 are normalized onto one internal shape
 (``definitions`` <-> ``components/schemas``, body parameter <-> requestBody)
@@ -46,10 +49,9 @@ _WRITE_METHODS = frozenset({"post", "put", "patch", "delete"})  # noqa: F841 —
 # emit tens of thousands of nodes into the merge.
 _MAX_OPS = 3000
 _MAX_SCHEMAS = 3000
-_MAX_SHARE_EDGES = 800
-# A schema referenced by more ops than this is a hub (e.g. the ubiquitous
-# ErrorResponse): pairwise shares_schema_with over it carries no signal.
-_HUB_SCHEMA_OPS = 30
+# shares_schema_with / subpath_of caps (_MAX_SHARE_EDGES, _HUB_SCHEMA_OPS)
+# now live in graphify.api_inference — those edges are computed at build
+# tier, cross-file.
 
 
 def _path_item_has_method(item: object) -> bool:
@@ -356,9 +358,6 @@ def extract_openapi(path: Path) -> dict:
 
     # --- operation nodes ---
     op_records: list[dict] = []       # {nid, method, raw_path, op}
-    op_ids_by_path: dict[str, list[str]] = {}
-    first_op_by_pm: dict[tuple[str, str], str] = {}  # (raw path, method) -> nid
-    ops_by_schema: dict[str, list[str]] = {}
 
     for raw_path, item in paths.items():
         if truncated:
@@ -388,10 +387,7 @@ def extract_openapi(path: Path) -> dict:
             add_edge(file_nid, nid, "contains")
             op_records.append({"nid": nid, "method": method,
                                "raw_path": raw_path, "op": op})
-            op_ids_by_path.setdefault(raw_path, []).append(nid)
-            first_op_by_pm.setdefault((raw_path, method), nid)
             for name in sorted(refs_read | refs_write):
-                ops_by_schema.setdefault(name, []).append(nid)
                 add_edge(nid, ensure_schema_node(name), "references",
                          context=("response schema" if name in refs_read
                                   else "request schema"))
@@ -409,46 +405,9 @@ def extract_openapi(path: Path) -> dict:
             add_edge(file_nid, tag_nid, "contains")
             add_edge(rec["nid"], tag_nid, "grouped_under")
 
-    # --- subpath_of: /users/{id}/orders -> same-method op of /users/{id} ---
-    def parent_path(raw_path: str) -> str | None:
-        segs = raw_path.split("/")
-        while len(segs) > 1:
-            segs = segs[:-1]
-            cand = "/".join(segs)
-            if cand and cand in paths and cand != raw_path:
-                return cand
-        return None
-
-    for rec in op_records:
-        parent = parent_path(rec["raw_path"])
-        if not parent:
-            continue
-        target = first_op_by_pm.get((parent, rec["method"]))
-        if target is None:
-            siblings = op_ids_by_path.get(parent) or []
-            if not siblings:
-                continue
-            target = siblings[0]
-        add_edge(rec["nid"], target, "subpath_of",
-                 context=f"{rec['raw_path']} nested under {parent}")
-
-    # --- shares_schema_with: operations referencing the same schema ---
-    share_count = 0
-    for name in sorted(ops_by_schema):
-        if share_count >= _MAX_SHARE_EDGES:
-            truncated = True
-            break
-        op_list = ops_by_schema[name]
-        if len(op_list) < 2 or len(op_list) > _HUB_SCHEMA_OPS:
-            continue
-        for i in range(len(op_list)):
-            for j in range(i + 1, len(op_list)):
-                if share_count >= _MAX_SHARE_EDGES:
-                    break
-                if add_edge(op_list[i], op_list[j], "shares_schema_with",
-                            confidence="INFERRED", score=0.95,
-                            context=f"shared schema: {name}"):
-                    share_count += 1
+    # --- subpath_of and shares_schema_with are computed at build tier in
+    # --- graphify.api_inference, so a per-endpoint split corpus still
+    # --- derives them across files. See _infer_op_structural_edges.
 
     # --- external $ref targets: concept nodes, mirroring json_config's J-4
     # --- namespacing so external pointers never collide with code nodes ---

@@ -56,10 +56,11 @@ When the corpus contains OpenAPI/Swagger JSON (any `.json` with an `openapi`/`sw
 
 - **operation nodes** — one per path × HTTP method (`GET /users`, `POST /orders`), carrying the referenced schema names split into `refs_read` (response side) and `refs_write` (request body side)
 - **schema / tag nodes** — named schemas (with their property lists, merging `allOf`/`anyOf`/`oneOf` composites) and tags
-- **EXTRACTED edges** — `references` (every `$ref`, including nested array/property/composite occurrences), `grouped_under` (operation → tag), `subpath_of` (nested path → parent), `contains` (spec file → node)
-- **INFERRED edge** — `shares_schema_with` (0.95) between operations referencing the same schema
+- **EXTRACTED edges** — `references` (every `$ref`, including nested array/property/composite occurrences), `grouped_under` (operation → tag), `contains` (spec file → node)
 
 The build phase then reverse-infers the **backend database entities** the API implies — the core premise being that a REST backend usually backs one table per resource. This runs after the per-file extractions merge and before dedup, in `api_inference.run_api_entity_inference`:
+
+- **op → op structural edges (cross-file)** — `subpath_of` (EXTRACTED, nested path operation → parent-path operation, same HTTP method preferred) and `shares_schema_with` (INFERRED 0.95, operations referencing the same schema NAME). These are computed at the build tier over the merged op set, NOT per-file in the extractor, so a spec split into one file per endpoint still derives them — the parent-path operation and the shared-schema operation may live in different spec files. Hub schemas referenced by >30 ops are skipped (an ubiquitous ErrorResponse would otherwise form an all-connected blob) and total `shares_schema_with` edges are capped at 800.
 
 - **resource extraction** — paths are split on `/`, `{param}` segments dropped, generic/version segments (`api`, `v1`) removed; the last non-param segment names the resource (`/users/{id}/orders` → `orders`)
 - **CRUD merge** — the full CRUD set over one resource collapses into ONE `inferred_entity` node (`devices (inferred)`), carrying `inferred: true` + `file_type: inferred_entity` as honest markers so virtual entities stay distinguishable from real structure in `graph.json` and `GRAPH_REPORT.md`

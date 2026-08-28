@@ -79,6 +79,14 @@ _CAMEL_VERB_RE = re.compile(
 
 _FUZZ_TABLE_THRESHOLD = 90
 
+# --- op-op structural edge caps (moved here from the extraction tier so the
+# --- pairing spans spec files; a per-endpoint split corpus still derives
+# --- these edges) ---
+_MAX_SHARE_EDGES = 800
+# A schema referenced by more ops than this is a hub (e.g. the ubiquitous
+# ErrorResponse): pairwise shares_schema_with over it carries no signal.
+_HUB_SCHEMA_OPS = 30
+
 
 def _is_rpc_segment(seg: str) -> bool:
     low = seg.lower()
@@ -157,6 +165,117 @@ def _match_table(resource_key: str, table_index: dict[str, list[dict]]) -> dict 
         if score > best_score:
             best_node, best_score = nodes[0], score
     return best_node if best_score >= _FUZZ_TABLE_THRESHOLD else None
+
+
+def _parent_path(api_path: str, paths: set[str]) -> str | None:
+    """Ancestor path of ``api_path`` that is itself a known operation path,
+    found by stripping the last segment repeatedly. None when no ancestor is
+    a known path. Cross-file: the parent operation may live in another spec."""
+    segs = api_path.split("/")
+    while len(segs) > 1:
+        segs = segs[:-1]
+        cand = "/".join(segs)
+        if cand and cand != api_path and cand in paths:
+            return cand
+    return None
+
+
+def _infer_op_structural_edges(op_nodes: list[dict], edge_fn) -> int:
+    """Emit the two operation-to-operation structural edges across the whole
+    merged op set (run at build tier so a per-endpoint split corpus — where
+    each file holds one operation — still derives them):
+
+    * ``subpath_of`` (EXTRACTED) — a nested-path operation links to its
+      parent-path operation; same HTTP method preferred, else the parent's
+      first sibling.
+    * ``shares_schema_with`` (INFERRED 0.95) — operations referencing the
+      same schema NAME pair up, with ``_HUB_SCHEMA_OPS`` / ``_MAX_SHARE_EDGES``
+      caps so a ubiquitous ErrorResponse does not produce an all-connected blob.
+
+    ``edge_fn(src, tgt, relation, score, source_file, context=, confidence=)``
+    handles dedup and the ``_origin: "ast"`` tier stamp. Returns the number of
+    shares_schema_with edges emitted (for truncation reporting).
+    """
+    if not op_nodes:
+        return 0
+
+    def _op_path(op: dict) -> str:
+        p = op.get("api_path")
+        if isinstance(p, str) and p:
+            return p
+        label = op.get("label")
+        if isinstance(label, str) and " " in label:
+            return label.split(" ", 1)[1]
+        return ""
+
+    # Global indices across all files.
+    paths: set[str] = set()
+    first_op_by_pm: dict[tuple[str, str], str] = {}  # (path, method) -> nid
+    op_ids_by_path: dict[str, list[str]] = {}
+    op_src: dict[str, str] = {}  # op id -> source_file
+    ops_by_schema: dict[str, list[str]] = {}  # schema NAME -> [op id]
+    for op in op_nodes:
+        nid = op.get("id", "")
+        if not nid:
+            continue
+        if isinstance(op.get("source_file"), str):
+            op_src[nid] = op["source_file"]
+        ap = _op_path(op)
+        if ap:
+            paths.add(ap)
+            op_ids_by_path.setdefault(ap, []).append(nid)
+        method = str(op.get("http_method") or "").upper()
+        if ap and method:
+            first_op_by_pm.setdefault((ap, method), nid)
+        seen: set[str] = set()
+        for name in (op.get("refs_read") or []) + (op.get("refs_write") or []):
+            if isinstance(name, str) and name and name not in seen:
+                seen.add(name)
+                ops_by_schema.setdefault(name, []).append(nid)
+
+    # --- subpath_of (EXTRACTED): nested path -> parent-path op ---
+    for op in op_nodes:
+        nid = op.get("id", "")
+        ap = _op_path(op)
+        if not nid or not ap:
+            continue
+        parent = _parent_path(ap, paths)
+        if not parent:
+            continue
+        method = str(op.get("http_method") or "").upper()
+        target = first_op_by_pm.get((parent, method))
+        if target is None:
+            siblings = op_ids_by_path.get(parent) or []
+            if not siblings:
+                continue
+            target = siblings[0]
+        edge_fn(nid, target, "subpath_of", 1.0,
+                op.get("source_file") or "",
+                context=f"{ap} nested under {parent}",
+                confidence="EXTRACTED")
+
+    # --- shares_schema_with (INFERRED 0.95): ops referencing same schema ---
+    share_count = 0
+    truncated = False
+    for name in sorted(ops_by_schema):
+        if share_count >= _MAX_SHARE_EDGES:
+            truncated = True
+            break
+        op_list = ops_by_schema[name]
+        if len(op_list) < 2 or len(op_list) > _HUB_SCHEMA_OPS:
+            continue
+        for i in range(len(op_list)):
+            for j in range(i + 1, len(op_list)):
+                if share_count >= _MAX_SHARE_EDGES:
+                    truncated = True
+                    break
+                src_file = op_src.get(op_list[i], "")
+                edge_fn(op_list[i], op_list[j], "shares_schema_with", 0.95,
+                        src_file,
+                        context=f"shared schema: {name}")
+                share_count += 1
+    # truncated exposed via the returned count for summary reporting
+    return share_count + (1 if truncated else 0)
 
 
 def run_api_entity_inference(extraction: dict) -> dict:
@@ -263,7 +382,8 @@ def run_api_entity_inference(extraction: dict) -> dict:
     first_source = lambda ent: sorted(ent["source_files"])[0] if ent["source_files"] else ""
 
     def _edge(src: str, tgt: str, relation: str, score: float,
-              source_file: str, context: str | None = None) -> None:
+              source_file: str, context: str | None = None,
+              confidence: str = "INFERRED") -> None:
         if not src or not tgt or src == tgt:
             return
         key = (src, tgt, relation)
@@ -271,15 +391,25 @@ def run_api_entity_inference(extraction: dict) -> dict:
             return
         seen_new_edges.add(key)
         edge = {"source": src, "target": tgt, "relation": relation,
-                "confidence": "INFERRED", "confidence_score": score,
-                "source_file": source_file, "weight": 1.0,
+                "confidence": confidence, "source_file": source_file,
+                "weight": 1.0,
                 # Deterministic derivation: stamp the tier so fuzzy dedup
                 # treats these as structural products and never folds an
                 # entity into a same-name schema node (#2334 tier rules).
                 "_origin": "ast"}
+        # EXTRACTED edges carry no confidence_score (matches the extraction
+        # tier's add_edge contract); INFERRED/AMBIGUOUS always do.
+        if confidence != "EXTRACTED":
+            edge["confidence_score"] = score
         if context:
             edge["context"] = context
         new_edges.append(edge)
+
+    # --- operation-to-operation structural edges, computed cross-file so a
+    # --- per-endpoint split corpus still derives subpath_of /
+    # --- shares_schema_with (these used to be per-file in the extractor;
+    # --- moved here so they span spec files). ---
+    _infer_op_structural_edges(op_nodes, _edge)
 
     for key, ent in entities.items():
         real = _match_table(key, table_index)

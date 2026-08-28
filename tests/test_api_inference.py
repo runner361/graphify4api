@@ -204,3 +204,46 @@ def test_unmatched_entity_survives_reconciliation():
     ext = {"nodes": nodes, "edges": []}
     run_api_entity_inference(ext)
     assert "users (inferred)" in _entities(ext)  # untouched, no AMBIGUOUS noise
+
+
+# --- cross-file op structural edges (#add-cross-file-structural-edges) ---
+# subpath_of / shares_schema_with moved from the per-file extractor to the
+# build tier so a per-endpoint split corpus (each file holds one operation)
+# still derives them across files.
+
+
+def test_cross_file_subpath_and_shares_schema():
+    """Two spec files: file A owns the /users and /users/{id} operations,
+    file B owns the nested /users/{id}/orders operations. Build-tier
+    inference must connect them across the file boundary — the exact gap
+    that a per-file extractor leaves at 0 for split corpora."""
+    file_a = "users.json"
+    file_b = "orders.json"
+    nodes = [
+        _op("a:get:users", "GET", "/users", refs_read=("User",), source_file=file_a),
+        _op("a:post:users", "POST", "/users", refs_write=("User",), source_file=file_a),
+        _op("a:get:users_id", "GET", "/users/{id}", refs_read=("User",), source_file=file_a),
+        _op("b:get:orders", "GET", "/users/{id}/orders", refs_read=("Order", "User"), source_file=file_b),
+        _op("b:post:orders", "POST", "/users/{id}/orders", refs_write=("Order",), source_file=file_b),
+    ]
+    ext = {"nodes": nodes, "edges": []}
+    run_api_entity_inference(ext)
+
+    a_ids = {n["id"] for n in nodes if n["source_file"] == file_a}
+    b_ids = {n["id"] for n in nodes if n["source_file"] == file_b}
+
+    sub = [e for e in ext["edges"] if e["relation"] == "subpath_of"]
+    # the nested GET /users/{id}/orders (file B) links to its parent-path
+    # GET /users/{id} (file A) across the file boundary
+    assert any(e["source"] in b_ids and e["target"] in a_ids for e in sub)
+    assert all(e["confidence"] == "EXTRACTED" for e in sub)
+
+    shares = [e for e in ext["edges"] if e["relation"] == "shares_schema_with"]
+    # User is referenced by ops in BOTH files → at least one cross-file pair
+    assert any((e["source"] in a_ids and e["target"] in b_ids) or
+               (e["source"] in b_ids and e["target"] in a_ids)
+               for e in shares)
+    assert all(e["confidence"] == "INFERRED" for e in shares)
+    assert all(e["confidence_score"] == 0.95 for e in shares)
+    assert all("shared schema" in e.get("context", "") for e in shares)
+

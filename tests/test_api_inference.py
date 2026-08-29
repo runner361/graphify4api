@@ -11,7 +11,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from graphify.api_inference import _path_resource, run_api_entity_inference
+from graphify.api_inference import (
+    _path_resource,
+    run_api_entity_inference,
+    run_api_schema_canonicalization,
+)
 from graphify.extract import extract_openapi
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -246,4 +250,117 @@ def test_cross_file_subpath_and_shares_schema():
     assert all(e["confidence"] == "INFERRED" for e in shares)
     assert all(e["confidence_score"] == 0.95 for e in shares)
     assert all("shared schema" in e.get("context", "") for e in shares)
+
+
+# --- cross-file schema canonicalization (#add-cross-file-schema-canonicalization) -
+
+
+def test_cross_file_schema_canonicalization():
+    # Two split spec files each define Device (complementary properties) and a
+    # DeviceList that $refs Device. Canonicalization must collapse each name to
+    # one canonical node (Device gets the property union), redirect edges off
+    # the deleted copies onto the canonicals, fold the now-duplicate schema->
+    # schema $ref edges to a single edge, and preserve EXTRACTED confidence.
+    nodes = [
+        _schema("s_dev_a", "Device", ["id", "name"], source_file="fileA.json"),
+        _schema("s_dev_b", "Device", ["id", "status"], source_file="fileB.json"),
+        _schema("s_list_a", "DeviceList", ["items"], source_file="fileA.json"),
+        _schema("s_list_b", "DeviceList", ["items"], source_file="fileB.json"),
+        _op("op_a", "GET", "/devices", refs_read=("Device",),
+            source_file="fileA.json"),
+    ]
+    edges = [
+        # spec root -> Device copy (contains, EXTRACTED) in each file
+        {"source": "specA", "target": "s_dev_a", "relation": "contains",
+         "confidence": "EXTRACTED", "source_file": "fileA.json",
+         "source_location": None, "weight": 1.0},
+        {"source": "specB", "target": "s_dev_b", "relation": "contains",
+         "confidence": "EXTRACTED", "source_file": "fileB.json",
+         "source_location": None, "weight": 1.0},
+        # op -> Device copy (references, EXTRACTED)
+        {"source": "op_a", "target": "s_dev_a", "relation": "references",
+         "confidence": "EXTRACTED", "source_file": "fileA.json",
+         "source_location": None, "weight": 1.0},
+        # DeviceList -> Device $ref in each file (references, EXTRACTED)
+        {"source": "s_list_a", "target": "s_dev_a", "relation": "references",
+         "confidence": "EXTRACTED", "source_file": "fileA.json",
+         "source_location": None, "weight": 1.0},
+        {"source": "s_list_b", "target": "s_dev_b", "relation": "references",
+         "confidence": "EXTRACTED", "source_file": "fileB.json",
+         "source_location": None, "weight": 1.0},
+    ]
+    ext = {"nodes": nodes, "edges": edges}
+    summary = run_api_schema_canonicalization(ext)
+
+    assert summary["merged_groups"] == 2      # Device + DeviceList
+    assert summary["nodes_removed"] == 2     # one copy per group deleted
+
+    # Device collapsed to ONE canonical node with the property union.
+    devs = [n for n in ext["nodes"]
+            if n.get("openapi_kind") == "schema" and n.get("schema_name") == "Device"]
+    assert len(devs) == 1
+    assert devs[0]["properties"] == ["id", "name", "status"]
+    lists = [n for n in ext["nodes"]
+             if n.get("openapi_kind") == "schema"
+             and n.get("schema_name") == "DeviceList"]
+    assert len(lists) == 1
+    canonical_dev = devs[0]["id"]
+    canonical_list = lists[0]["id"]
+
+    # contains edges redirected onto canonical Device (two distinct spec roots
+    # -> two edges, not folded).
+    contains = [e for e in ext["edges"] if e["relation"] == "contains"]
+    assert {e["source"] for e in contains} == {"specA", "specB"}
+    assert all(e["target"] == canonical_dev for e in contains)
+
+    # op->schema references redirected to canonical Device.
+    refs_op = [e for e in ext["edges"]
+               if e["relation"] == "references" and e["source"] == "op_a"]
+    assert len(refs_op) == 1
+    assert refs_op[0]["target"] == canonical_dev
+
+    # schema->schema $ref edges folded from 2 (one per file) to 1, both
+    # endpoints redirected to the canonicals.
+    refs_ss = [e for e in ext["edges"]
+               if e["relation"] == "references"
+               and e["source"] == canonical_list]
+    assert len(refs_ss) == 1
+    assert refs_ss[0]["target"] == canonical_dev
+    # confidence preserved across redirect + fold (first edge kept).
+    assert refs_ss[0]["confidence"] == "EXTRACTED"
+
+    # no surviving edge still points at a deleted copy id.
+    deleted = {"s_dev_a", "s_dev_b", "s_list_a", "s_list_b"} - {canonical_dev,
+                                                                canonical_list}
+    for e in ext["edges"]:
+        assert e["source"] not in deleted
+        assert e["target"] not in deleted
+
+
+def test_canonicalization_bundle_is_noop():
+    # A bundle (single-file) spec has no same-name schema duplicates, so
+    # canonicalization must be a no-op: no node removed, no edge folded, all
+    # ids unchanged.
+    nodes = [
+        _schema("s_dev", "Device", ["id", "name"], source_file="api.json"),
+        _schema("s_user", "User", ["id", "email"], source_file="api.json"),
+        _op("op1", "GET", "/devices", refs_read=("Device",),
+            source_file="api.json"),
+    ]
+    edges = [
+        {"source": "op1", "target": "s_dev", "relation": "references",
+         "confidence": "EXTRACTED", "source_file": "api.json",
+         "source_location": None, "weight": 1.0},
+    ]
+    ext = {"nodes": nodes, "edges": edges}
+    before_nids = [n["id"] for n in ext["nodes"]]
+    before_esig = [(e["source"], e["target"], e["relation"]) for e in ext["edges"]]
+
+    summary = run_api_schema_canonicalization(ext)
+
+    assert summary == {"merged_groups": 0, "nodes_removed": 0,
+                       "edges_folded": 0}
+    assert [n["id"] for n in ext["nodes"]] == before_nids
+    assert ([(e["source"], e["target"], e["relation"])
+             for e in ext["edges"]] == before_esig)
 

@@ -1378,7 +1378,15 @@ def build(
     # clustering like any other product. Local import keeps the module's
     # import graph acyclic (api_inference lives at build tier, not extractor
     # tier, so nothing else pulls it in at package load).
-    from graphify.api_inference import run_api_entity_inference
+    from graphify.api_inference import (
+        run_api_schema_canonicalization,
+        run_api_entity_inference,
+    )
+    # #add-cross-file-schema-canonicalization: collapse same-name schema
+    # copies (from per-endpoint split specs) into one canonical node BEFORE
+    # entity inference, so it sees the merged property union + deduped $ref
+    # graph. No-op for bundle specs (single file, no duplicates).
+    run_api_schema_canonicalization(combined)
     run_api_entity_inference(combined)
     if dedup and combined["nodes"]:
         # Numeric ids must be str before dedup, which keys on them and would

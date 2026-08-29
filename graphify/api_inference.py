@@ -502,3 +502,97 @@ def run_api_entity_inference(extraction: dict) -> dict:
     summary["nodes"] = len(new_nodes)
     summary["edges"] = len(new_edges)
     return summary
+
+
+def run_api_schema_canonicalization(extraction: dict) -> dict:
+    """Mutate the merged build input in place: collapse same-``schema_name``
+    schema nodes (across spec files) into ONE canonical node per name,
+    merging their properties (union), redirecting edges off copies onto the
+    canonical, deduping the now-duplicate edges, and deleting the copies.
+
+    Runs before :func:`run_api_entity_inference` so entity inference sees the
+    merged property union and a deduped schema->schema ``$ref`` graph.
+
+    Schema identity is the bare ``schema_name`` — that is how ``$ref``
+    resolves within a spec. For a per-endpoint split corpus (one API, many
+    files) same name == same schema; the property union is the logical
+    schema's full shape (each file defines a partial view). No-op when no
+    name has >1 node. Honest about the cross-service collision trade-off in
+    the design doc: a mixed multi-service corpus with colliding names would
+    over-merge; that is not the target corpus shape.
+    """
+    nodes: list[dict] = extraction.get("nodes")  # type: ignore[assignment]
+    if nodes is None:
+        nodes = []
+        extraction["nodes"] = nodes
+    edges: list[dict] = extraction.get("edges")  # type: ignore[assignment]
+    if edges is None:
+        edges = []
+        extraction["edges"] = edges
+
+    # group schema nodes by schema_name
+    by_name: dict[str, list[dict]] = {}
+    for n in nodes:
+        if not isinstance(n, dict) or n.get("openapi_kind") != "schema":
+            continue
+        name = n.get("schema_name")
+        if isinstance(name, str) and name:
+            by_name.setdefault(name, []).append(n)
+
+    redirect: dict[str, str] = {}   # copy id -> canonical id
+    copies: set[str] = set()
+    merged_groups = 0
+    for name, group in by_name.items():
+        if len(group) < 2:
+            continue
+        merged_groups += 1
+        # canonical = richest properties (longest list), tie -> first max
+        canonical = max(group, key=lambda n: len(n.get("properties") or []))
+        merged_props: set[str] = set(canonical.get("properties") or [])
+        for n in group:
+            if n is canonical:
+                continue
+            props = n.get("properties")
+            if isinstance(props, list):
+                merged_props.update(str(p) for p in props)
+            redirect[n["id"]] = canonical["id"]
+            copies.add(n["id"])
+        canonical["properties"] = sorted(merged_props)
+
+    summary = {"merged_groups": merged_groups, "nodes_removed": 0,
+               "edges_folded": 0}
+    if not copies:
+        return summary
+
+    # redirect edges off copies onto canonicals + dedup by (src, tgt, rel).
+    # Mutate edge dicts in place to preserve confidence / context / _origin.
+    seen: set[tuple] = set()
+    kept: list[dict] = []
+    for e in edges:
+        if not isinstance(e, dict):
+            kept.append(e)
+            continue
+        src = redirect.get(e.get("source"), e.get("source"))
+        tgt = redirect.get(e.get("target"), e.get("target"))
+        rel = e.get("relation")
+        if src == tgt:
+            summary["edges_folded"] += 1  # self-loop after redirect: drop
+            continue
+        key = (src, tgt, rel)
+        if key in seen:
+            summary["edges_folded"] += 1
+            continue
+        seen.add(key)
+        if src != e.get("source"):
+            e["source"] = src
+        if tgt != e.get("target"):
+            e["target"] = tgt
+        kept.append(e)
+    edges[:] = kept
+
+    before = len(nodes)
+    nodes[:] = [n for n in nodes
+                if not (isinstance(n, dict) and n.get("id") in copies)]
+    summary["nodes_removed"] = before - len(nodes)
+    return summary
+

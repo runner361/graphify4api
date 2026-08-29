@@ -73,6 +73,8 @@ When the corpus also contains real DDL (`.sql` `CREATE TABLE` nodes), reconcilia
 
 Entity node ids are global (`entity_<resource>`), not per-file, so the same resource split across several spec files merges into one entity.
 
+A **schema canonicalization** step (`api_inference.run_api_schema_canonicalization`) runs just before entity inference, merging same-`schema_name` schema nodes that a per-endpoint split corpus produces (each file redefines the schemas it references). For each name, the richest copy becomes the canonical node, the others' properties are folded into a union, edges off the copies are redirected onto the canonical, duplicate `(source, target, relation)` edges are folded, and the copies are deleted. This makes a split corpus (one API, many files) stop fragmenting one logical schema into dozens of isolated nodes — a bundle corpus (single file, no duplicates) is a no-op.
+
 ---
 
 ## Token benchmark

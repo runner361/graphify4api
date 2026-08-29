@@ -256,6 +256,39 @@ def generate(
             conf_tag = f"{conf} {cscore:.2f}" if cscore is not None else conf
             lines.append(f"- **{h.get('label', h.get('id', ''))}** — {node_labels} [{conf_tag}]")
 
+    # Feature tier (#add-feature-api-linking): feature -> API operation / entity
+    # edges. Only emitted when the graph actually contains feature nodes, so a
+    # corpus with no product-doc directories is byte-identical to the pre-feature
+    # report. Edges carry an `evidence` attr; "name-match" marks the no-LLM
+    # degradation path so the reader knows that run was lexical-only.
+    feature_nodes = [n for n, d in G.nodes(data=True) if d.get("file_type") == "feature"]
+    if feature_nodes:
+        lines += ["", "## Feature → Interface / Entity"]
+        link_edges = [(u, v, d) for u, v, d in G.edges(data=True)
+                      if d.get("relation") in ("implemented_by", "uses_entity")]
+        by_feature: dict[str, list] = {}
+        for u, v, d in link_edges:
+            by_feature.setdefault(u, []).append((v, d))
+        degraded = any(d.get("evidence") == "name-match" for *_, d in link_edges)
+        if degraded:
+            lines.append("_仅名称匹配，LLM 未参与 — 这些边是退级路径产出的词面匹配，请人工复核。_")
+        for fn in feature_nodes:
+            fid = fn
+            flabel = G.nodes[fid].get("label", fid)
+            items = by_feature.get(fid, [])
+            if not items:
+                continue
+            lines.append(f"- **{flabel}** ({len(items)} link{'s' if len(items) != 1 else ''})")
+            for tgt, d in items:
+                tlabel = G.nodes[tgt].get("label", tgt)
+                rel = d.get("relation", "?")
+                conf = d.get("confidence", "INFERRED")
+                cscore = d.get("confidence_score")
+                conf_tag = f"{conf} {cscore:.2f}" if cscore is not None else conf
+                ev = d.get("evidence", "")
+                ev_tag = f"  _{ev}_" if ev else ""
+                lines.append(f"  - {rel} → `{tlabel}` [{conf_tag}]{ev_tag}")
+
     lines += ["", f"## Communities ({len(communities)} total, {thin_count_summary} thin omitted)"]
     for cid, nodes in communities.items():
         label = community_labels.get(cid, f"Community {cid}")

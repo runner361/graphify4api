@@ -75,6 +75,18 @@ Entity node ids are global (`entity_<resource>`), not per-file, so the same reso
 
 A **schema canonicalization** step (`api_inference.run_api_schema_canonicalization`) runs just before entity inference, merging same-`schema_name` schema nodes that a per-endpoint split corpus produces (each file redefines the schemas it references). For each name, the richest copy becomes the canonical node, the others' properties are folded into a union, edges off the copies are redirected onto the canonical, duplicate `(source, target, relation)` edges are folded, and the copies are deleted. This makes a split corpus (one API, many files) stop fragmenting one logical schema into dozens of isolated nodes — a bundle corpus (single file, no duplicates) is a no-op.
 
+## Feature → interface/entity linking (product-doc directories)
+
+When the corpus also contains **product documentation organized as one subdirectory per feature** (each subdirectory directly holds the `.md` files describing that feature), graphify builds a feature tier on top of the API/entity nodes above (`feature_link.generate_feature_nodes` + `feature_link.run_feature_linking`, run after entity inference, before dedup).
+
+- **Feature nodes are deterministic.** A directory that directly contains `.md` files *is* a feature (any depth); nested feature directories link to their nearest ancestor via `subfeature_of` (EXTRACTED), and each feature links to its docs via `contains` (EXTRACTED). Root-level scattered docs and empty directories get no feature node — directory structure is ground truth, the LLM never participates in feature-node creation.
+- **Linking is two-stage and LLM-adjudicated.** For each feature, a deterministic rapidfuzz `token_set_ratio` prescreen shortlists the top-N `api_operation` and `inferred_entity` nodes whose path/segments/columns overlap the feature's doc keywords. The shortlist then goes to the LLM (same multi-backend dispatch as extraction) with a strict JSON contract — `{target_id, relation, confidence_score, evidence}` — and an anti-hallucination whitelist that drops any `target_id` the prescreen did not surface. Links are `implemented_by` (feature → operation) and `uses_entity` (feature → entity), always INFERRED with a discrete `confidence_score` and a mandatory `evidence` quote from the docs; LLM self-ratings below the rubric floor become AMBIGUOUS and surface in `GRAPH_REPORT.md` for review.
+- **Cross-lingual bridge.** Feature names are often Chinese while paths/table names are English — there is no shared lexeme. The prescreen therefore scores on the English technical terms the doc *bodies* mention (API paths, protocol and table names), which bridge the Chinese feature name to the English path tokens.
+- **Degradation without an LLM.** When no backend is configured, a name-match path takes over: a candidate whose English overlap with the feature text scores ≥ 90 becomes an INFERRED 0.65 edge with `evidence: "name-match"`; below 90 no edge is built. This is honest — a Chinese feature doc with no English path tokens in its body produces zero edges rather than invented ones. `GRAPH_REPORT.md` flags these runs as lexical-only.
+- **Dual-hash cache.** Each adjudication result is cached under a key hashing both the feature's doc text and the candidate shortlist, so reruns are free and a changed candidate set correctly invalidates.
+
+`query`, `path`, and `explain` traverse the new edges with no code change — "which interfaces does this feature touch" is now a graph walk from the feature node.
+
 ---
 
 ## Token benchmark

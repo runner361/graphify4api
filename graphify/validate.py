@@ -4,7 +4,10 @@ from __future__ import annotations
 VALID_FILE_TYPES = {"code", "document", "paper", "image", "rationale", "concept",
                     # OpenAPI tier (#add-openapi-extractor): one node per path×method,
                     # and build-phase reverse-derived database entities.
-                    "api_operation", "inferred_entity"}
+                    "api_operation", "inferred_entity",
+                    # Feature tier (#add-feature-api-linking): one node per product
+                    # feature directory, linking features to API ops / entities.
+                    "feature"}
 VALID_CONFIDENCES = {"EXTRACTED", "INFERRED", "AMBIGUOUS"}
 REQUIRED_NODE_FIELDS = {"id", "label", "file_type", "source_file"}
 REQUIRED_EDGE_FIELDS = {"source", "target", "relation", "confidence", "source_file"}

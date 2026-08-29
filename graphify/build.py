@@ -1388,6 +1388,19 @@ def build(
     # graph. No-op for bundle specs (single file, no duplicates).
     run_api_schema_canonicalization(combined)
     run_api_entity_inference(combined)
+    # Feature tier (#add-feature-api-linking): deterministic feature nodes from
+    # markdown-directory structure, then LLM-adjudicated (or name-match
+    # degraded) implemented_by / uses_entity edges to the api_operation /
+    # inferred_entity nodes above. Runs AFTER entity inference (targets must
+    # exist) and BEFORE dedup so feature nodes/edges flow through dedup and
+    # clustering like any other product. Local import keeps the import graph
+    # acyclic (feature_link lives at build tier).
+    from graphify.feature_link import (
+        generate_feature_nodes,
+        run_feature_linking,
+    )
+    generate_feature_nodes(combined)
+    run_feature_linking(combined)
     if dedup and combined["nodes"]:
         # Numeric ids must be str before dedup, which keys on them and would
         # raise TypeError in _pick_winner's regex search (#2326). build_from_json

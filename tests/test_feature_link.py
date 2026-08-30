@@ -267,3 +267,201 @@ def test_no_api_targets_is_noop(tmp_path):
     generate_feature_nodes(ext)
     s = run_feature_linking(ext, llm_call=lambda p: "{}", cache_root=str(tmp_path / "c"))
     assert s["edges"] == 0
+
+
+# --- stage 3.4 explicit backend injection (#add-feature-link-backend) ------
+
+
+def test_llm_backend_routes_through_call_llm(tmp_path, monkeypatch):
+    """llm_backend name is wrapped around llm._call_llm: the stub is invoked
+    with backend=<name> and its JSON return becomes adjudication edges."""
+    import graphify.feature_link as fl_mod
+
+    captured: dict = {}
+
+    def fake_call_llm(prompt, *, backend, max_tokens, **kw):
+        captured["backend"] = backend
+        return json.dumps([{"target_id": "op_refund", "relation": "implemented_by",
+                            "confidence_score": 0.95, "evidence": "claude-cli adjudicated"}])
+
+    monkeypatch.setattr("graphify.llm._call_llm", fake_call_llm)
+    n = _md_node("退款/退款流程.md", "# 退款\n调用 POST /refund-orders 接口", tmp_path)
+    op = _op("op_refund", "POST", "/refund-orders")
+    ext = {"nodes": [n, op], "edges": [], "hyperedges": [], "input_tokens": 0, "output_tokens": 0}
+    generate_feature_nodes(ext)
+    s = run_feature_linking(ext, llm_backend="claude-cli", cache_root=str(tmp_path / "c"))
+    assert s["llm"] is True
+    assert captured["backend"] == "claude-cli"
+    impl = [e for e in ext["edges"] if e["relation"] == "implemented_by"]
+    assert len(impl) == 1 and impl[0]["target"] == "op_refund"
+    assert impl[0]["evidence"] != "name-match"   # LLM-adjudicated, not degraded
+
+
+def test_llm_backend_unavailable_degrades_to_name_match(tmp_path, monkeypatch):
+    """When the explicit backend raises (e.g. claude not on PATH), the wrapper
+    returns None and the no-LLM degradation path runs — no hard failure."""
+    def fake_call_llm(*a, **kw):
+        raise RuntimeError("claude: command not found")
+
+    monkeypatch.setattr("graphify.llm._call_llm", fake_call_llm)
+    n = _md_node("退款/退款流程.md", "# 退款\n调用 POST /refund-orders 接口", tmp_path)
+    op = _op("op_refund", "POST", "/refund-orders")
+    ext = {"nodes": [n, op], "edges": [], "hyperedges": [], "input_tokens": 0, "output_tokens": 0}
+    generate_feature_nodes(ext)
+    s = run_feature_linking(ext, llm_backend="claude-cli", cache_root=str(tmp_path / "c"))
+    # strong name-match (>=90) still produces a degraded edge, no crash
+    assert s["edges"] >= 1
+    impl = [e for e in ext["edges"] if e["relation"] == "implemented_by"]
+    assert impl and impl[0]["evidence"] == "name-match"
+
+
+def test_explicit_llm_call_takes_precedence_over_llm_backend(tmp_path, monkeypatch):
+    """When both llm_call and llm_backend are given, llm_call wins and
+    llm_backend is never consulted."""
+    called = {"llm_call": 0, "call_llm": 0}
+
+    def fake_call_llm(*a, **kw):
+        called["call_llm"] += 1
+        return None
+
+    monkeypatch.setattr("graphify.llm._call_llm", fake_call_llm)
+    n = _md_node("退款/退款流程.md", "# 退款\n调用 POST /refund-orders 接口", tmp_path)
+    op = _op("op_refund", "POST", "/refund-orders")
+    ext = {"nodes": [n, op], "edges": [], "hyperedges": [], "input_tokens": 0, "output_tokens": 0}
+    generate_feature_nodes(ext)
+
+    def my_callable(prompt):
+        called["llm_call"] += 1
+        return json.dumps([{"target_id": "op_refund", "relation": "implemented_by",
+                            "confidence_score": 0.95, "evidence": "via llm_call"}])
+
+    run_feature_linking(ext, llm_call=my_callable, llm_backend="claude-cli",
+                        cache_root=str(tmp_path / "c"))
+    assert called["llm_call"] >= 1 and called["call_llm"] == 0
+
+
+# --- scenario capability gloss bridge (#add-scenario-api-linking-via-gloss) --
+
+
+def _scenario_node(label: str, capability: str, nid: str = "feat_scn") -> dict:
+    """An operation-scenario feature node as emitted by Part B
+    (add-scenario-capability-gloss): file_type "feature" + English capability
+    gloss, source_file pointing at the .md page (no feature_dir, so its fdir
+    degrades to the .md path and body scraping yields nothing — the gloss IS
+    the bridge)."""
+    return {"id": nid, "label": label, "file_type": "feature",
+            "scenario_kind": "operation", "capability": capability,
+            "source_file": f"用户指南/iotdm/实例标签管理/{label}.md"}
+
+
+def test_scenario_capability_gloss_bridges_cross_lingual(tmp_path):
+    """Chinese operation page (label "删除标签", no English body) carries an
+    English `capability:"delete tag"` gloss; the real iotda op has an UPPERCASE
+    method DELETE + plural `tags`. The gloss bridges via case-insensitive
+    prescreen -> candidate reaches the LLM -> implemented_by edge."""
+    scn = _scenario_node("删除标签", "delete tag")
+    op = _op("op_deltag", "DELETE", "/v5/iot/{project_id}/instances/{instance_id}/tags/{tag_id}")
+    ext = {"nodes": [scn, op], "edges": [], "hyperedges": [], "input_tokens": 0, "output_tokens": 0}
+    generate_feature_nodes(ext)   # scenario node passthroughs (not _is_md_file_node)
+    mock = json.dumps([{"target_id": "op_deltag", "relation": "implemented_by",
+                        "confidence_score": 0.95, "evidence": "delete tag via DELETE tags API"}])
+    s = run_feature_linking(ext, llm_call=lambda p: mock, cache_root=str(tmp_path / "c"))
+    assert s["llm"] is True                       # LLM WAS called -> candidate bridged through
+    impl = [e for e in ext["edges"] if e["relation"] == "implemented_by"]
+    assert len(impl) == 1 and impl[0]["target"] == "op_deltag"
+    assert s["unmapped"] == 0
+
+
+def test_scenario_without_gloss_zero_candidates_zero_regression(tmp_path):
+    """Same scenario node but NO capability field: Chinese label only, no
+    English body scraped (fdir degrades to .md path -> no page nodes) ->
+    bridge empty -> 0 candidates -> LLM never called, unmapped, 0 edges.
+    Proves the gloss (not the label) is what bridges."""
+    scn = _scenario_node("删除标签", "delete tag")
+    del scn["capability"]                          # simulate pre-gloss / unsupported subagent
+    op = _op("op_deltag", "DELETE", "/v5/iot/{project_id}/instances/{instance_id}/tags/{tag_id}")
+    ext = {"nodes": [scn, op], "edges": [], "hyperedges": [], "input_tokens": 0, "output_tokens": 0}
+    generate_feature_nodes(ext)
+    calls = {"n": 0}
+
+    def llm(p):
+        calls["n"] += 1
+        return json.dumps([{"target_id": "op_deltag", "relation": "implemented_by",
+                            "confidence_score": 0.95, "evidence": "x"}])
+    s = run_feature_linking(ext, llm_call=llm, cache_root=str(tmp_path / "c"))
+    assert calls["n"] == 0                         # LLM never invoked (no candidate)
+    assert s["edges"] == 0 and s["unmapped"] == 1 and s["llm"] is False
+
+
+def test_scenario_no_matching_api_honest_empty(tmp_path):
+    """Scenario has a gloss but no API candidate overlaps it -> unmapped, 0
+    edges, no fabrication (honest empty)."""
+    scn = _scenario_node("删除标签", "delete tag")
+    # billing invoice op — no token overlap with "delete tag"
+    op = _op("op_bill", "POST", "/v5/billing/invoices/{invoice_id}")
+    ext = {"nodes": [scn, op], "edges": [], "hyperedges": [], "input_tokens": 0, "output_tokens": 0}
+    generate_feature_nodes(ext)
+    s = run_feature_linking(ext, llm_call=lambda p: "[]", cache_root=str(tmp_path / "c"))
+    assert s["edges"] == 0 and s["unmapped"] == 1
+    assert not [e for e in ext["edges"] if e["relation"] in ("implemented_by", "uses_entity")]
+
+
+def test_prescreen_case_insensitive_uppercase_method():
+    """token_set_ratio is case-sensitive by default; the cross-lingual gloss
+    bridge (lowercase gloss vs UPPERCASE HTTP method) needs case-insensitive
+    scoring. 'delete tag' vs op_text 'DELETE ... tags' must clear the floor."""
+    from graphify.feature_link import _prescreen
+    op = _op("o", "DELETE", "/v5/iot/{p}/tags/{t}")
+    got = _prescreen("delete tag", [(op, _op_text(op))], top_n=5)
+    assert got and got[0]["id"] == "o"            # bridged despite DELETE vs delete + tag vs tags
+
+
+def test_scenario_verb_gap_bypasses_strict_prescreen(tmp_path):
+    """The real cross-lingual verb-gap the strict gate starves: gloss `add tag`
+    vs API `tagDevice` (POST /tags). The gloss verb `add` is absent from the op
+    (method is POST, not ADD) and `tag` != `tags` (number) -> token_set_ratio
+    ~22, well under 60. A scenario node's `capability` triggers the bypass
+    channel: prescreen ranks top-N without gating -> the candidate reaches the
+    LLM -> implemented_by edge. This is the fix validated end-to-end on the full
+    iotdm+iotda corpus (strict 60 -> 7 edges; scenario bypass -> 92)."""
+    from graphify.feature_link import _prescreen, _op_text
+    scn = _scenario_node("添加标签", "add tag")
+    op = _op("op_tagdev", "POST", "/v5/iot/{project_id}/tags")
+    op["label"] = "tagDevice"
+    ext = {"nodes": [scn, op], "edges": [], "hyperedges": [], "input_tokens": 0, "output_tokens": 0}
+    generate_feature_nodes(ext)
+    # sanity: the strict floor WOULD gate this verb-gap pair out
+    assert not _prescreen("add tag", [(op, _op_text(op))], top_n=5)
+    mock = json.dumps([{"target_id": "op_tagdev", "relation": "implemented_by",
+                        "confidence_score": 0.95, "evidence": "add tag via tagDevice API"}])
+    s = run_feature_linking(ext, llm_call=lambda p: mock, cache_root=str(tmp_path / "c"))
+    assert s["llm"] is True                         # bypass routed the candidate to the LLM
+    impl = [e for e in ext["edges"] if e["relation"] == "implemented_by"]
+    assert len(impl) == 1 and impl[0]["target"] == "op_tagdev"
+    assert s["unmapped"] == 0
+
+
+def test_feature_without_capability_keeps_strict_gate(tmp_path):
+    """A feature node lacking `capability` (e.g. a dir-feature) does NOT get the
+    scenario bypass: even with an English label that scores < 60 against the op,
+    the strict 60 gate starves it and the LLM is never called. Proves the bypass
+    is scoped to `capability`-bearing scenario nodes only -- dir-features have
+    no gloss, fuzz is their only signal, and the gate avoids flooding the LLM
+    with every-feature->all-ops calls."""
+    calls = {"n": 0}
+    df = {"id": "feat_dir", "label": "add tag", "file_type": "feature",  # English but no capability
+          "feature_dir": "用户指南/iotdm/实例标签管理",
+          "source_file": "用户指南/iotdm/实例标签管理/"}
+    op = _op("op_tagdev", "POST", "/v5/iot/{project_id}/tags")
+    op["label"] = "tagDevice"
+    ext = {"nodes": [df, op], "edges": [], "hyperedges": [], "input_tokens": 0, "output_tokens": 0}
+    generate_feature_nodes(ext)
+
+    def llm(p):
+        calls["n"] += 1
+        return json.dumps([{"target_id": "op_tagdev", "relation": "implemented_by",
+                            "confidence_score": 0.95, "evidence": "x"}])
+    s = run_feature_linking(ext, llm_call=llm, cache_root=str(tmp_path / "c"))
+    assert calls["n"] == 0, "non-scenario feature must stay under the strict 60 gate"
+    assert s["edges"] == 0 and s["unmapped"] == 1 and s["llm"] is False
+

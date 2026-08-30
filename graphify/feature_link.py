@@ -51,6 +51,22 @@ _AMBIGUOUS_FLOOR = 0.55
 _TOP_N = 20              # max candidates per feature sent to the LLM (D2)
 _MIN_PRESCREEN = 60.0    # below this a candidate is not worth the LLM's time
 _NAME_MATCH_THRESHOLD = 90.0  # degradation: >= this -> 0.65 name-match edge (D6)
+# Scenario nodes (file_type "feature" with a `capability` gloss) carry a
+# structured English verb+noun bridge that token-level fuzz cannot exploit:
+# API op names are camelCase compounds (tagDevice, createCommand) that don't
+# split into the gloss's words, nouns differ in number (tag vs tags), and the
+# gloss verb (add/delete/send) rarely appears as a standalone token in the op
+# text. A >=60 hard gate therefore starves the LLM of correct candidates
+# (empirically 19-22 for `delete tag` vs the tag ops). For scenario nodes
+# prescreen only RANKS (returns top-N by score) and never gates -- the LLM
+# adjudicator, which reads semantics, decides. Validated end-to-end on the full
+# iotdm+iotda corpus: strict 60 -> 7 feature->API/entity edges; scenario bypass
+# -> 92, nearly all correct, with the LLM honestly returning 0 for the ~9
+# scenarios that have no matching API (delete tag/deploy plugin/reset credential)
+# (#add-scenario-api-linking-via-gloss). dir-features keep the 60 gate -- they
+# have no gloss, so fuzz is their only signal and the gate avoids flooding the
+# LLM with Chinese-label -> all-ops calls.
+_SCENARIO_MIN_PRESCREEN = 0.0
 
 _MD_EXTS = (".md", ".mdx", ".qmd", ".skill")
 _RELATIONS = ("implemented_by", "uses_entity")
@@ -231,8 +247,21 @@ def _feature_text(feature: dict, file_nodes: list[dict],
     under the feature's files + English technical terms scraped from the doc
     bodies (D7: the body terms bridge Chinese feature names to English
     path/table tokens — without them prescreen can't surface cross-lingual
-    candidates and the LLM never gets a shortlist)."""
+    candidates and the LLM never gets a shortlist).
+
+    For operation-scenario feature nodes (file_type "feature" emitted by Part B
+    per add-scenario-capability-gloss), the node carries an English
+    ``capability`` gloss (e.g. "delete tag") distilled from the page. That gloss
+    IS the cross-lingual bridge for these nodes — their ``fdir`` degrades to
+    the ``.md`` path itself (no dir-keyed page nodes), so body scraping yields
+    nothing for them; the gloss replaces it. Appended here so ``_prescreen``'s
+    ``_english_terms`` bridge picks it up and matches English op_text. Nodes
+    without ``capability`` (dir-category features, legacy extractions) append
+    nothing — zero regression."""
     parts = [feature.get("label", "")]
+    cap = feature.get("capability")
+    if cap:
+        parts.append(cap)
     for fn in file_nodes:
         parts.append(PurePath(fn.get("source_file", "")).stem)
     # heading/concept nodes whose source_file lives under this feature
@@ -258,10 +287,14 @@ def _feature_text(feature: dict, file_nodes: list[dict],
 
 
 def _prescreen(feature_text: str, candidates: list[tuple[dict, str]],
-               top_n: int = _TOP_N) -> list[dict]:
+               top_n: int = _TOP_N,
+               min_prescreen: float = _MIN_PRESCREEN) -> list[dict]:
     """rapidfuzz token_set_ratio shortlist. ``candidates`` is a list of
     ``(node, candidate_text)``. Returns up to ``top_n`` nodes scoring >=
-    ``_MIN_PRESCREEN``, highest first.
+    ``min_prescreen``, highest first. ``min_prescreen`` defaults to the strict
+    ``_MIN_PRESCREEN`` gate; callers pass ``_SCENARIO_MIN_PRESCREEN`` (0.0) for
+    scenario nodes so prescreen only ranks top-N and never gates -- letting the
+    LLM adjudicate verb/number/compound-name gaps fuzz can't bridge.
 
     Scoring uses only the English-termlink subset of ``feature_text``: the
     feature name is usually Chinese and shares no lexeme with English path /
@@ -276,9 +309,15 @@ def _prescreen(feature_text: str, candidates: list[tuple[dict, str]],
     except ImportError:  # pragma: no cover - rapidfuzz is a core dep
         return [c[0] for c in candidates[:top_n]]
     scored = []
+    # Case-insensitive: HTTP methods are conventionally uppercase (DELETE/POST),
+    # capability glosses and doc-body terms are lowercase, and path segments
+    # are lowercase. A case-sensitive token_set_ratio would miss the obvious
+    # `delete tag` (gloss) <-> `DELETE ... tags` (op_text) overlap that the
+    # cross-lingual gloss bridge exists to surface (#add-scenario-api-linking).
+    bridge_l = bridge.lower()
     for node, ctxt in candidates:
-        score = fuzz.token_set_ratio(bridge, ctxt)
-        if score >= _MIN_PRESCREEN:
+        score = fuzz.token_set_ratio(bridge_l, ctxt.lower())
+        if score >= min_prescreen:
             scored.append((score, node))
     scored.sort(key=lambda t: t[0], reverse=True)
     return [n for _, n in scored[:top_n]]
@@ -397,9 +436,10 @@ def _degrade(op_cands: list[dict], ent_cands: list[dict], feature_text: str
     except ImportError:  # pragma: no cover
         return []
     out = []
+    bridge_l = bridge.lower()
     for n in op_cands + ent_cands:
         ctxt = _op_text(n) if n.get("file_type") == "api_operation" else _entity_text(n)
-        if fuzz.token_set_ratio(bridge, ctxt) >= _NAME_MATCH_THRESHOLD:
+        if fuzz.token_set_ratio(bridge_l, ctxt.lower()) >= _NAME_MATCH_THRESHOLD:
             rel = "implemented_by" if n.get("file_type") == "api_operation" else "uses_entity"
             out.append({"target_id": n["id"], "relation": rel,
                         "confidence_score": 0.65, "confidence": "INFERRED",
@@ -463,6 +503,7 @@ def run_feature_linking(
     extraction: dict,
     *,
     llm_call=None,
+    llm_backend: str | None = None,
     top_n: int = _TOP_N,
     cache_root=None,
 ) -> dict:
@@ -475,6 +516,15 @@ def run_feature_linking(
     ``llm_call``: optional ``(prompt: str) -> str | None`` for tests to inject
     a stub backend. Defaults to the real llm.py dispatch; when no backend is
     configured the degradation path runs.
+
+    ``llm_backend``: optional explicit backend name (e.g. "claude-cli",
+    "gemini", "kimi") routed through llm.py's ``_call_llm``. Resolution
+    precedence: explicit ``llm_call`` > explicit ``llm_backend`` > the
+    ``detect_backend`` default (``_default_llm_call``). ``claude-cli`` lets a
+    caller route adjudication through the local ``claude -p`` subscription
+    backend (no API key) instead of relying on ``detect_backend``, which never
+    auto-selects it. When an explicit backend is unavailable the wrapper
+    returns None and the degradation path runs (no hard failure).
     """
     nodes: list[dict] = extraction.get("nodes", [])  # type: ignore[assignment]
     edges: list[dict] = extraction.get("edges", [])  # type: ignore[assignment]
@@ -485,12 +535,27 @@ def run_feature_linking(
                 if n.get("file_type") == "inferred_entity"
                 or n.get("inferred_columns") is not None]
     if not features or (not ops and not entities):
-        return {"features": len(features), "edges": 0, "llm": False}
+        # features exist but nothing to map them to -> all unmapped (honest empty)
+        return {"features": len(features), "edges": 0, "llm": False,
+                "unmapped": len(features)}
 
     if cache_root is None:
         cache_root = "graphify-out/cache"
     if llm_call is None:
-        llm_call = _default_llm_call
+        if llm_backend is not None:
+            # Explicit backend name (e.g. "claude-cli") → wrap _call_llm so the
+            # caller need only pass a str, not a callable. Exceptions (backend
+            # missing, claude -p empty/timeout) → None → degradation path.
+            from graphify.llm import _call_llm  # type: ignore
+            _backend = llm_backend
+
+            def llm_call(prompt: str, _b=_backend) -> str | None:
+                try:
+                    return _call_llm(prompt, backend=_b, max_tokens=2048)
+                except Exception:
+                    return None
+        else:
+            llm_call = _default_llm_call
 
     op_cand_pairs = [(n, _op_text(n)) for n in ops]
     ent_cand_pairs = [(n, _entity_text(n)) for n in entities]
@@ -506,6 +571,9 @@ def run_feature_linking(
 
     made = 0
     used_llm = False
+    unmapped = 0  # features that produced 0 edges -- prescreen-starved OR
+                  # LLM-adjudicated-and-rejected. Honest-empty count: a feature
+                  # here reached no API/entity mapping (#add-scenario-api-linking).
     seen_edges: set[tuple] = set()
 
     def _emit(feature_id: str, payload: dict) -> None:
@@ -525,10 +593,17 @@ def run_feature_linking(
     for feat in features:
         fdir = feat.get("feature_dir") or (feat.get("source_file", "").rstrip("/"))
         ftext = _feature_text(feat, files_by_dir.get(fdir, []), all_doc_nodes)
-        op_cands = _prescreen(ftext, op_cand_pairs, top_n)
-        ent_cands = _prescreen(ftext, ent_cand_pairs, top_n)
+        # Scenario nodes carry an English `capability` gloss; token-level fuzz
+        # can't bridge verb/number/compound-name gaps to the API (add<->tagDevice,
+        # tag<->tags), so don't hard-gate them. Let prescreen rank top-N and the
+        # LLM adjudicate. dir-features keep the strict 60 gate (no gloss -> fuzz
+        # is their only signal).
+        pthresh = _SCENARIO_MIN_PRESCREEN if feat.get("capability") else _MIN_PRESCREEN
+        op_cands = _prescreen(ftext, op_cand_pairs, top_n, min_prescreen=pthresh)
+        ent_cands = _prescreen(ftext, ent_cand_pairs, top_n, min_prescreen=pthresh)
         cand_ids = {n["id"] for n in op_cands + ent_cands}
         if not cand_ids:
+            unmapped += 1
             continue
 
         ckey = _cache_key(ftext, sorted(cand_ids))
@@ -537,6 +612,8 @@ def run_feature_linking(
             for payload in cached:
                 _emit(feat["id"], payload)
                 made += 1
+            if not cached:
+                unmapped += 1   # cached honest-empty adjudication
             continue
 
         prompt = _build_prompt(feat, op_cands, ent_cands, ftext)
@@ -549,6 +626,9 @@ def run_feature_linking(
         for payload in payloads:
             _emit(feat["id"], payload)
             made += 1
+        if not payloads:
+            unmapped += 1   # adjudicated but no mapping found (honest empty)
         _save_cache(cache_root, ckey, payloads)
 
-    return {"features": len(features), "edges": made, "llm": used_llm}
+    return {"features": len(features), "edges": made, "llm": used_llm,
+            "unmapped": unmapped}

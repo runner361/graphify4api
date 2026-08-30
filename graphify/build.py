@@ -1348,6 +1348,7 @@ def build(
     dedup: bool = True,
     dedup_llm_backend: str | None = None,
     root: str | Path | None = None,
+    feature_llm_backend: str | None = None,
 ) -> nx.Graph:
     """Merge multiple extraction results into one graph.
 
@@ -1357,6 +1358,12 @@ def build(
     dedup_llm_backend: if set (e.g. "gemini", "claude", or "kimi"), uses LLM to resolve
         ambiguous pairs in the 75–92 Jaro-Winkler score zone.
     root: if given, absolute source_file paths are made relative to root (#932).
+    feature_llm_backend: if set (e.g. "claude-cli", "gemini"), routes the
+        feature→API/entity adjudication in ``run_feature_linking`` through that
+        backend instead of ``detect_backend``. ``claude-cli`` uses the local
+        ``claude -p`` subscription backend (no API key); when unset or the
+        backend is unavailable, the existing degradation path runs. Mirrors
+        ``dedup_llm_backend``.
 
     With dedup disabled, extractions are merged in order and the last node's
     attributes win (NetworkX add_node overwrites). With dedup enabled, nodes
@@ -1400,7 +1407,7 @@ def build(
         run_feature_linking,
     )
     generate_feature_nodes(combined)
-    run_feature_linking(combined)
+    run_feature_linking(combined, llm_backend=feature_llm_backend)
     if dedup and combined["nodes"]:
         # Numeric ids must be str before dedup, which keys on them and would
         # raise TypeError in _pick_winner's regex search (#2326). build_from_json

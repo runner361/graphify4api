@@ -1627,3 +1627,50 @@ def test_derive_prune_root_recovers_root_from_posix_absolute_prune_sources():
     assert _derive_prune_root(
         ["/home/ci/build/repo/docs/a.md"], stored
     ) == "/home/ci/build/repo"
+
+
+def test_build_threads_feature_llm_backend_to_run_feature_linking(monkeypatch):
+    """build()'s feature_llm_backend kwarg is forwarded as llm_backend to
+    run_feature_linking (mirrors dedup_llm_backend)."""
+    import graphify.build as build_mod
+
+    captured: dict = {}
+    real_generate = build_mod.generate_feature_nodes if hasattr(build_mod, "generate_feature_nodes") else None
+
+    def fake_run_feature_linking(extraction, *, llm_backend=None, **kw):
+        captured["llm_backend"] = llm_backend
+        return {"features": 0, "edges": 0, "llm": False}
+
+    # build() imports run_feature_linking locally; patch the source module so
+    # the local import picks up the stub.
+    import graphify.feature_link as fl_mod
+    monkeypatch.setattr(fl_mod, "run_feature_linking", fake_run_feature_linking)
+    # generate_feature_nodes is also imported locally; patch to a no-op so we
+    # don't need real markdown nodes.
+    monkeypatch.setattr(fl_mod, "generate_feature_nodes",
+                        lambda ext: {"features": 0, "contains": 0, "subfeature_of": 0})
+    # Skip the api_inference passes + dedup side effects by giving empty input.
+    ext = {"nodes": [], "edges": [], "hyperedges": [],
+           "input_tokens": 0, "output_tokens": 0}
+    build([ext], feature_llm_backend="claude-cli", dedup=False)
+    assert captured.get("llm_backend") == "claude-cli"
+
+
+def test_build_feature_llm_backend_defaults_to_none(monkeypatch):
+    """Without the kwarg, run_feature_linking gets llm_backend=None (unchanged
+    default behavior)."""
+    import graphify.feature_link as fl_mod
+
+    captured: dict = {}
+
+    def fake_run_feature_linking(extraction, *, llm_backend=None, **kw):
+        captured["llm_backend"] = llm_backend
+        return {"features": 0, "edges": 0, "llm": False}
+
+    monkeypatch.setattr(fl_mod, "run_feature_linking", fake_run_feature_linking)
+    monkeypatch.setattr(fl_mod, "generate_feature_nodes",
+                        lambda ext: {"features": 0, "contains": 0, "subfeature_of": 0})
+    ext = {"nodes": [], "edges": [], "hyperedges": [],
+           "input_tokens": 0, "output_tokens": 0}
+    build([ext], dedup=False)
+    assert captured.get("llm_backend") is None

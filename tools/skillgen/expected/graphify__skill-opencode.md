@@ -384,13 +384,13 @@ print(f'Merged: {total} nodes, {edges} edges ({len(ast[\"nodes\"])} AST + {len(s
 
 ### Step 4 - Build graph, cluster, analyze, generate outputs
 
-**Before starting:** the code blocks below pass `directed=IS_DIRECTED` to `build_from_json()`. Replace `IS_DIRECTED` with `True` if `--directed` was given (builds a `DiGraph` preserving edge direction source→target), otherwise `False` (the default undirected `Graph`). Substitute it the same way you substitute `INPUT_PATH` — do not leave the literal `IS_DIRECTED` in the code.
+**Before starting:** the code blocks below pass `directed=IS_DIRECTED` to `build()` (the build-tier wrapper), NOT the lower-level `build_from_json()`. `build()` runs the full inference pipeline before constructing the graph — same-name schema canonicalization, cross-file op structural edges + `inferred_entity` reverse-inference, and feature-linking — so these passes engage on the skill path exactly as they do on the CLI (`build_from_json` skips all three; using it here would silently drop every cross-file/INFERRED edge and every feature→API `implemented_by`/`uses_entity` edge). The call also passes `feature_llm_backend='claude-cli'` so the feature→API/entity adjudicator runs through the local `claude -p` subscription backend (no API key); when that backend is unavailable it degrades to the name-match path, so the skill still works on a code-only corpus. Replace `IS_DIRECTED` with `True` if `--directed` was given (builds a `DiGraph` preserving edge direction source→target), otherwise `False` (the default undirected `Graph`). Substitute it the same way you substitute `INPUT_PATH` — do not leave the literal `IS_DIRECTED` in the code.
 
 ```bash
 mkdir -p graphify-out
 $(cat graphify-out/.graphify_python) -c "
 import sys, json
-from graphify.build import build_from_json
+from graphify.build import build
 from graphify.cluster import cluster, score_all
 from graphify.analyze import god_nodes, surprising_connections, suggest_questions
 from graphify.report import generate
@@ -400,9 +400,12 @@ from pathlib import Path
 extraction = json.loads(Path('graphify-out/.graphify_extract.json').read_text(encoding=\"utf-8\"))
 detection  = json.loads(Path('graphify-out/.graphify_detect.json').read_text(encoding=\"utf-8\"))
 
-# root= mirrors the --update runbook (#1361): relativize source_file to the same
-# base so the full build and incremental --update never drift apart on re-extract.
-G = build_from_json(extraction, root='INPUT_PATH', directed=IS_DIRECTED)
+# build() (not build_from_json) so schema canonicalization + cross-file op
+# structural edges + feature-linking run before graph construction.
+# feature_llm_backend='claude-cli' routes the feature→API/entity adjudicator
+# through the local claude -p subscription (no API key); degrades to name-match
+# if that backend is unavailable.
+G = build([extraction], root='INPUT_PATH', directed=IS_DIRECTED, feature_llm_backend='claude-cli')
 # Guard BEFORE any write: an empty extraction must not clobber a good graph.json /
 # GRAPH_REPORT.md / analysis sidecar. Check immediately after build (#1392).
 if G.number_of_nodes() == 0:
@@ -480,7 +483,7 @@ Then regenerate the report and save the labels for the visualizer:
 ```bash
 $(cat graphify-out/.graphify_python) -c "
 import sys, json
-from graphify.build import build_from_json
+from graphify.build import build
 from graphify.cluster import score_all
 from graphify.analyze import god_nodes, surprising_connections, suggest_questions
 from graphify.report import generate
@@ -491,8 +494,10 @@ extraction = json.loads(Path('graphify-out/.graphify_extract.json').read_text(en
 detection  = json.loads(Path('graphify-out/.graphify_detect.json').read_text(encoding=\"utf-8\"))
 analysis   = json.loads(Path('graphify-out/.graphify_analysis.json').read_text(encoding=\"utf-8\"))
 
-# root= as in Step 4 / the --update runbook (#1361) — same base for node-key parity.
-G = build_from_json(extraction, root='INPUT_PATH', directed=IS_DIRECTED)
+# build() (not build_from_json) so Step 5 reproduces Step 4's exact graph
+# (inferred edges + dedup + feature-linking included); otherwise
+# communities/ids would drift. feature_llm_backend as in Step 4.
+G = build([extraction], root='INPUT_PATH', directed=IS_DIRECTED, feature_llm_backend='claude-cli')
 communities = {int(k): v for k, v in analysis['communities'].items()}
 cohesion = {int(k): v for k, v in analysis['cohesion'].items()}
 tokens = {'input': extraction.get('input_tokens', 0), 'output': extraction.get('output_tokens', 0)}

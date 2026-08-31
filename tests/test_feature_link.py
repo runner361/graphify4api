@@ -465,3 +465,148 @@ def test_feature_without_capability_keeps_strict_gate(tmp_path):
     assert calls["n"] == 0, "non-scenario feature must stay under the strict 60 gate"
     assert s["edges"] == 0 and s["unmapped"] == 1 and s["llm"] is False
 
+
+# --- stage 3.5 concurrency ------------------------------------------------
+
+def _multi_feature_corpus(tmp_path):
+    """Three feature dirs, each doc body mentioning a distinct API path so
+    prescreen yields one candidate per feature -> 3 LLM adjudications."""
+    n1 = _md_node("退款/refund.md", "# 退款\n调用 POST /refund-orders 接口", tmp_path)
+    n2 = _md_node("订单/order.md", "# 订单\n创建 POST /orders 接口", tmp_path)
+    n3 = _md_node("用户/user.md", "# 用户\n查询 GET /users 接口", tmp_path)
+    ops = [_op("op_refund", "POST", "/refund-orders"),
+           _op("op_order", "POST", "/orders"),
+           _op("op_user", "GET", "/users")]
+    ext = {"nodes": [n1, n2, n3, *ops], "edges": [], "hyperedges": [],
+           "input_tokens": 0, "output_tokens": 0}
+    generate_feature_nodes(ext)
+    return ext
+
+
+def _edge_key(e):
+    return (e["source"], e["target"], e["relation"], e["confidence_score"])
+
+
+def _linking_edges(ext):
+    """Only the INFERRED implemented_by / uses_entity edges carry
+    confidence_score; the EXTRACTED `contains` structural edges don't."""
+    return [e for e in ext["edges"]
+            if e["relation"] in ("implemented_by", "uses_entity")]
+
+
+def test_parallel_path_matches_serial_output(tmp_path):
+    """The ThreadPoolExecutor fan-out must emit the same edges as the serial
+    path. An injected llm_call stub sets backend-name unknown -> the
+    claude-cli/ollama serial guard is skipped -> the parallel path runs for
+    max_concurrency>1. Output is merged in submission order, not completion
+    order, so the edge sequence is identical to workers==1 (#1632)."""
+    def llm(p):
+        # Each prompt names exactly one op; echo back an edge to whatever id
+        # appears in the prompt text.
+        for op_id in ("op_refund", "op_order", "op_user"):
+            if op_id in p:
+                return json.dumps([{"target_id": op_id, "relation": "implemented_by",
+                                    "confidence_score": 0.95, "evidence": "matched"}])
+        return "[]"
+
+    ext_serial = _multi_feature_corpus(tmp_path)
+    s = run_feature_linking(ext_serial, llm_call=llm,
+                            cache_root=str(tmp_path / "serial"),
+                            max_concurrency=1)
+    assert s["llm"] is True and s["edges"] == 3
+
+    ext_par = _multi_feature_corpus(tmp_path)
+    p = run_feature_linking(ext_par, llm_call=llm,
+                            cache_root=str(tmp_path / "par"),
+                            max_concurrency=4)
+    assert p == s   # summary stats identical
+    # Edge set identical regardless of completion order.
+    assert sorted(map(_edge_key, _linking_edges(ext_serial))) == \
+        sorted(map(_edge_key, _linking_edges(ext_par)))
+
+
+def test_injected_stub_runs_parallel_path(tmp_path, monkeypatch):
+    """With an injected llm_call (no backend name), the serial guard never
+    trips, so max_concurrency>1 actually fans out. Assert the pool is used by
+    counting concurrent llm_call invocations."""
+    import graphify.feature_link as fl_mod
+
+    ext = _multi_feature_corpus(tmp_path)
+    in_flight = {"now": 0, "peak": 0}
+
+    def llm(p):
+        in_flight["now"] += 1
+        in_flight["peak"] = max(in_flight["peak"], in_flight["now"])
+        import time
+        time.sleep(0.05)          # widen the window so concurrency is observable
+        in_flight["now"] -= 1
+        for op_id in ("op_refund", "op_order", "op_user"):
+            if op_id in p:
+                return json.dumps([{"target_id": op_id, "relation": "implemented_by",
+                                    "confidence_score": 0.95, "evidence": "matched"}])
+        return "[]"
+
+    s = run_feature_linking(ext, llm_call=llm,
+                            cache_root=str(tmp_path / "c"),
+                            max_concurrency=4)
+    assert s["edges"] == 3
+    assert in_flight["peak"] >= 2, "expected concurrent llm_call invocations"
+
+
+def test_claude_cli_backend_forced_serial_by_default(tmp_path, monkeypatch):
+    """llm_backend='claude-cli' (no env opt-in) must take the serial path even
+    when max_concurrency>1 is requested — mirrors the extract/community-label
+    guard. llm_call is NOT injected, so llm_backend drives dispatch and the
+    guard applies; assert zero concurrency through the _call_llm stub."""
+    monkeypatch.delenv("GRAPHIFY_CLAUDE_CLI_PARALLEL", raising=False)
+
+    in_flight = {"now": 0, "peak": 0}
+
+    def fake_call_llm(prompt, *, backend, max_tokens, **kw):
+        in_flight["now"] += 1
+        in_flight["peak"] = max(in_flight["peak"], in_flight["now"])
+        import time
+        time.sleep(0.05)          # widen the window so concurrency is observable
+        in_flight["now"] -= 1
+        for op_id in ("op_refund", "op_order", "op_user"):
+            if op_id in prompt:
+                return json.dumps([{"target_id": op_id, "relation": "implemented_by",
+                                    "confidence_score": 0.95, "evidence": "matched"}])
+        return "[]"
+    monkeypatch.setattr("graphify.llm._call_llm", fake_call_llm)
+
+    ext = _multi_feature_corpus(tmp_path)
+    s = run_feature_linking(ext, llm_backend="claude-cli",
+                            cache_root=str(tmp_path / "c"),
+                            max_concurrency=4)
+    assert s["edges"] == 3
+    assert in_flight["peak"] == 1, "claude-cli must stay serial without GRAPHIFY_CLAUDE_CLI_PARALLEL=1"
+
+
+def test_claude_cli_parallel_opt_in(tmp_path, monkeypatch):
+    """GRAPHIFY_CLAUDE_CLI_PARALLEL=1 lifts the claude-cli serial guard, so
+    max_concurrency>1 actually fans out — the user's opt-in path to speedup."""
+    monkeypatch.setenv("GRAPHIFY_CLAUDE_CLI_PARALLEL", "1")
+
+    in_flight = {"now": 0, "peak": 0}
+
+    def fake_call_llm(prompt, *, backend, max_tokens, **kw):
+        in_flight["now"] += 1
+        in_flight["peak"] = max(in_flight["peak"], in_flight["now"])
+        import time
+        time.sleep(0.05)
+        in_flight["now"] -= 1
+        for op_id in ("op_refund", "op_order", "op_user"):
+            if op_id in prompt:
+                return json.dumps([{"target_id": op_id, "relation": "implemented_by",
+                                    "confidence_score": 0.95, "evidence": "matched"}])
+        return "[]"
+    monkeypatch.setattr("graphify.llm._call_llm", fake_call_llm)
+
+    ext = _multi_feature_corpus(tmp_path)
+    s = run_feature_linking(ext, llm_backend="claude-cli",
+                            cache_root=str(tmp_path / "c"),
+                            max_concurrency=4)
+    assert s["edges"] == 3
+    assert in_flight["peak"] >= 2, "GRAPHIFY_CLAUDE_CLI_PARALLEL=1 must unlock the fan-out"
+

@@ -37,7 +37,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path, PurePath
 
 # --- prescreen / rubric constants ---------------------------------------
@@ -506,6 +508,7 @@ def run_feature_linking(
     llm_backend: str | None = None,
     top_n: int = _TOP_N,
     cache_root=None,
+    max_concurrency: int | None = None,
 ) -> dict:
     """Mutate ``extraction`` in place: for each feature node, prescreen + LLM
     adjudicate (or degrade) against the corpus's api_operation / entity nodes,
@@ -525,6 +528,17 @@ def run_feature_linking(
     backend (no API key) instead of relying on ``detect_backend``, which never
     auto-selects it. When an explicit backend is unavailable the wrapper
     returns None and the degradation path runs (no hard failure).
+
+    ``max_concurrency``: max parallel LLM adjudications for uncached features.
+    Defaults to ``GRAPHIFY_MAX_WORKERS`` (or 4 when unset). Mirrors the
+    extract / community-labeling fan-out contract: claude-cli and ollama are
+    forced serial unless opted in via ``GRAPHIFY_CLAUDE_CLI_PARALLEL=1`` /
+    ``GRAPHIFY_OLLAMA_PARALLEL=1`` (parallel ``claude -p`` subprocesses
+    conflict over session state, #798/#2554). ``workers == 1`` keeps the
+    original sequential path verbatim, so claude-cli default behaviour is
+    byte-identical to the pre-concurrency path. Output is deterministic
+    (merged in submission order, not completion order) so identical input
+    yields identical edges run-to-run (#1632).
     """
     nodes: list[dict] = extraction.get("nodes", [])  # type: ignore[assignment]
     edges: list[dict] = extraction.get("edges", [])  # type: ignore[assignment]
@@ -541,6 +555,7 @@ def run_feature_linking(
 
     if cache_root is None:
         cache_root = "graphify-out/cache"
+    _caller_injected = llm_call is not None
     if llm_call is None:
         if llm_backend is not None:
             # Explicit backend name (e.g. "claude-cli") → wrap _call_llm so the
@@ -556,6 +571,23 @@ def run_feature_linking(
                     return None
         else:
             llm_call = _default_llm_call
+
+    # Resolve a backend name for the concurrency guard. claude-cli / ollama are
+    # forced serial unless opted in (parallel `claude -p` subprocesses conflict
+    # over session state, #798/#2554) — mirrors the guard in extract /
+    # community-labeling (llm.py). The guard must reflect the *actual dispatch*
+    # backend: when the caller injected `llm_call`, llm_backend is not consulted
+    # for dispatch (precedence: llm_call > llm_backend), so it isn't trusted
+    # for the guard either — the stub may not shell out to `claude -p` at all.
+    # Only the backends we resolved ourselves (llm_backend name or
+    # detect_backend) carry a name the guard can act on.
+    if _caller_injected:
+        _backend_name: str | None = None
+    elif llm_backend is not None:
+        _backend_name = llm_backend
+    else:
+        from graphify.llm import detect_backend  # type: ignore
+        _backend_name = detect_backend()
 
     op_cand_pairs = [(n, _op_text(n)) for n in ops]
     ent_cand_pairs = [(n, _entity_text(n)) for n in entities]
@@ -590,6 +622,12 @@ def run_feature_linking(
             "weight": 1.0,
         })
 
+    # Phase A — prescreen + cache (serial, fast). The LLM adjudication is the
+    # only slow step, so defer it: cached features emit inline and skip the LLM
+    # entirely; uncached features queue a work item for Phase B. Behaviour is
+    # identical to the pre-concurrency single-pass loop — only the LLM call is
+    # postponed.
+    llm_work: list[dict] = []
     for feat in features:
         fdir = feat.get("feature_dir") or (feat.get("source_file", "").rstrip("/"))
         ftext = _feature_text(feat, files_by_dir.get(fdir, []), all_doc_nodes)
@@ -616,19 +654,83 @@ def run_feature_linking(
                 unmapped += 1   # cached honest-empty adjudication
             continue
 
-        prompt = _build_prompt(feat, op_cands, ent_cands, ftext)
-        raw = llm_call(prompt)
+        llm_work.append({
+            "feat": feat, "cand_ids": cand_ids, "ckey": ckey,
+            "op_cands": op_cands, "ent_cands": ent_cands, "ftext": ftext,
+            "prompt": _build_prompt(feat, op_cands, ent_cands, ftext),
+        })
+
+    def _apply(item: dict, raw: str | None) -> None:
+        # Apply one LLM result on the main thread. parse/degrade/emit/cache +
+        # counter updates all live here so shared state (edges, seen_edges,
+        # made/used_llm/unmapped, cache writes) is never mutated concurrently —
+        # same rationale as community labeling's merge (llm.py).
+        nonlocal made, used_llm, unmapped
+        feat = item["feat"]
+        cand_ids = item["cand_ids"]
         if raw is not None:
             used_llm = True
             payloads = _parse_adjudication(raw, cand_ids)
         else:
-            payloads = _degrade(op_cands, ent_cands, ftext)
+            payloads = _degrade(item["op_cands"], item["ent_cands"], item["ftext"])
         for payload in payloads:
             _emit(feat["id"], payload)
             made += 1
         if not payloads:
             unmapped += 1   # adjudicated but no mapping found (honest empty)
-        _save_cache(cache_root, ckey, payloads)
+        _save_cache(cache_root, item["ckey"], payloads)
+
+    if not llm_work:
+        return {"features": len(features), "edges": made, "llm": used_llm,
+                "unmapped": unmapped}
+
+    # Concurrency budget. LLM adjudication is latency-bound, not CPU-bound, so a
+    # small fixed cap is right and avoids hammering a subscription. Reuses
+    # GRAPHIFY_MAX_WORKERS (already set by `--max-workers`) for opt-in scaling.
+    if max_concurrency is None or max_concurrency < 1:
+        env_raw = os.environ.get("GRAPHIFY_MAX_WORKERS", "").strip()
+        max_concurrency = 4
+        if env_raw:
+            try:
+                v = int(env_raw)
+                if v > 0:
+                    max_concurrency = v
+            except ValueError:
+                pass
+    # Mirror the extract / community-labeling guards verbatim: claude-cli and
+    # ollama are serial unless explicitly opted in.
+    if _backend_name == "claude-cli" and os.environ.get("GRAPHIFY_CLAUDE_CLI_PARALLEL", "").strip() != "1":
+        max_concurrency = 1
+    if _backend_name == "ollama" and os.environ.get("GRAPHIFY_OLLAMA_PARALLEL", "").strip() != "1":
+        max_concurrency = 1
+    workers = max(1, min(max_concurrency, len(llm_work)))
+
+    # Phase B — LLM fan-out. workers == 1 keeps the original sequential path
+    # verbatim so claude-cli default behaviour is byte-identical to today.
+    if workers == 1:
+        for item in llm_work:
+            _apply(item, llm_call(item["prompt"]))
+    else:
+        # Worker returns its own index so results can be merged in submission
+        # order (NOT completion order) — the emitted edge sequence stays
+        # deterministic run-to-run (#1632), identical to the serial path.
+        # llm_call already swallows backend errors → None (degradation), but
+        # defend per-future so one pathological raise can't abort the pool.
+        def _work(i: int, prompt: str) -> tuple[int, str | None]:
+            try:
+                return i, llm_call(prompt)
+            except Exception:  # noqa: BLE001 — degrade this feature, keep going
+                return i, None
+
+        raws: dict[int, str | None] = {}
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(_work, i, item["prompt"])
+                       for i, item in enumerate(llm_work)]
+            for fut in as_completed(futures):
+                i, raw = fut.result()
+                raws[i] = raw
+        for i, item in enumerate(llm_work):
+            _apply(item, raws[i])
 
     return {"features": len(features), "edges": made, "llm": used_llm,
             "unmapped": unmapped}

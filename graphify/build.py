@@ -1349,6 +1349,7 @@ def build(
     dedup_llm_backend: str | None = None,
     root: str | Path | None = None,
     feature_llm_backend: str | None = None,
+    feature_max_concurrency: int | None = None,
 ) -> nx.Graph:
     """Merge multiple extraction results into one graph.
 
@@ -1364,6 +1365,10 @@ def build(
         ``claude -p`` subscription backend (no API key); when unset or the
         backend is unavailable, the existing degradation path runs. Mirrors
         ``dedup_llm_backend``.
+    feature_max_concurrency: max parallel LLM adjudications in
+        ``run_feature_linking`` (None → ``GRAPHIFY_MAX_WORKERS`` or 4).
+        claude-cli / ollama stay serial unless opted in via env
+        (``GRAPHIFY_CLAUDE_CLI_PARALLEL`` / ``GRAPHIFY_OLLAMA_PARALLEL``).
 
     With dedup disabled, extractions are merged in order and the last node's
     attributes win (NetworkX add_node overwrites). With dedup enabled, nodes
@@ -1407,7 +1412,8 @@ def build(
         run_feature_linking,
     )
     generate_feature_nodes(combined)
-    run_feature_linking(combined, llm_backend=feature_llm_backend)
+    run_feature_linking(combined, llm_backend=feature_llm_backend,
+                         max_concurrency=feature_max_concurrency)
     if dedup and combined["nodes"]:
         # Numeric ids must be str before dedup, which keys on them and would
         # raise TypeError in _pick_winner's regex search (#2326). build_from_json
